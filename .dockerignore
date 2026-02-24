@@ -1,0 +1,35 @@
+# Виртуальное окружение и кэш
+.venv
+venv
+env
+__pycache__
+*.py[cod]
+*.pyo
+.pytest_cache
+.mypy_cache
+.ruff_cache
+
+# Git и IDE
+.git
+.gitignore
+.cursor
+.vscode
+.idea
+*.md
+!README.md
+
+# Тесты и скрипты разработки (в образ не копируем)
+tests
+scripts
+docs
+agent-transcripts
+mcps
+
+# Локальные конфиги и секреты
+.env
+.env.*
+!.env.example
+
+# Прочее
+*.log
+.DS_Store

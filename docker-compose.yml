@@ -1,0 +1,38 @@
+# Kodeks superadmin: Auth API + Kafka workers.
+# При деплое подставьте свои KAFKA_BOOTSTRAP_SERVERS и DB_URL (или PG_*).
+# Для локальной проверки без Kafka закомментируйте воркеры или поднимите Kafka отдельно.
+
+services:
+  auth-api:
+    build: .
+    command: ["python", "main.py"]
+    ports:
+      - "8000:8000"
+    env_file: .env
+    environment:
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    restart: unless-stopped
+
+  users-worker:
+    build: .
+    command: ["python", "main_users.py"]
+    env_file: .env
+    environment:
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    restart: unless-stopped
+
+  init-company-worker:
+    build: .
+    command: ["python", "main_init_company.py"]
+    env_file: .env
+    environment:
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    restart: unless-stopped
+
+  reg-company-worker:
+    build: .
+    command: ["python", "main_reg_company.py"]
+    env_file: .env
+    environment:
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    restart: unless-stopped

@@ -1,0 +1,2 @@
+acl_infoboard_p000e={"kw": ["31"]}
+acl_infoboard_p000e_view={"kw": ["31"]}
