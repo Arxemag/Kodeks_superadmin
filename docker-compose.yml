@@ -1,6 +1,7 @@
 # Kodeks superadmin: Auth API + единый Kafka worker (одна группа, все топики).
+# БД — отдельно (свой контейнер или хост). В .env укажите хост БД: из контейнера
+# это имя контейнера с PostgreSQL или host.docker.internal, если БД на хосте.
 # При деплое подставьте KAFKA_BOOTSTRAP_SERVERS и DB_URL (или PG_*).
-# В .env задайте KAFKA_GROUP_ID — одна группа для всех топиков.
 
 services:
   auth-api:

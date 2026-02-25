@@ -42,7 +42,7 @@ docker compose build
 docker compose up -d
 ```
 
-Поднятся оба сервиса: `auth-api` и `worker`. Только API без воркера: `docker compose up -d auth-api`.
+Поднятся оба сервиса: `auth-api` и `worker`. Только API без воркера: `docker compose up -d auth-api`. БД поднимается отдельно; в `.env` для Docker укажите хост БД: **имя контейнера** с PostgreSQL (если БД в Docker) или `host.docker.internal` (если БД на хосте), не `localhost`.
 
 ### Если БД и Kafka на хосте, а не в Docker
 
@@ -52,6 +52,9 @@ docker compose up -d
 - **Linux:** IP хоста в сети Docker (например `172.17.0.1`) или вынести Kafka/PostgreSQL в тот же `docker-compose` и указывать имя сервиса (например `kafka:9092`, `postgres:5432`).
 
 Иначе будут ошибки вида `Connect call failed ('127.0.0.1', 9092)` и постоянные перезапуски.
+
+**Если при запросах к API (например `/api/infoboards/link`) в логах появляется `ConnectionRefusedError` к БД:** в контейнере хост `localhost` указывает на сам контейнер. В `.env` замените в `DB_URL` хост на `host.docker.internal` (Windows/macOS), например:
+`DB_URL=postgresql+asyncpg://user:password@host.docker.internal:5432/your_db`. Либо задайте `PG_HOST=host.docker.internal` и не заполняйте `DB_URL` (тогда URL соберётся из `PG_*`).
 
 ---
 
