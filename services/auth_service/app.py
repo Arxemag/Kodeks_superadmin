@@ -13,7 +13,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, RedirectResponse, Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -118,6 +118,16 @@ def create_app() -> FastAPI:
         service = AuthService(db=db, settings=settings)
         cookies = await service.login(reg=reg, name=name)
         return OkResponse(cookies=cookies)
+
+    @app.get(
+        "/api/infoboards/link",
+        include_in_schema=False,
+    )
+    async def redirect_infoboards_link(request: Request):
+        """Редирект со старого пути на /api/expert/infoboards/link (обратная совместимость)."""
+        query = request.url.query
+        path = f"/api/expert/infoboards/link" + (f"?{query}" if query else "")
+        return RedirectResponse(url=path, status_code=307)
 
     @app.get(
         "/api/expert/infoboards/link",

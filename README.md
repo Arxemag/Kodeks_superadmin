@@ -53,7 +53,7 @@ docker compose up -d
 
 Иначе будут ошибки вида `Connect call failed ('127.0.0.1', 9092)` и постоянные перезапуски.
 
-**Если при запросах к API (например `/api/infoboards/link`) в логах появляется `ConnectionRefusedError` к БД:** в контейнере хост `localhost` указывает на сам контейнер. В `.env` замените в `DB_URL` хост на `host.docker.internal` (Windows/macOS), например:
+**Если при запросах к API (например `/api/expert/infoboards/link`) в логах появляется `ConnectionRefusedError` к БД:** в контейнере хост `localhost` указывает на сам контейнер. В `.env` замените в `DB_URL` хост на `host.docker.internal` (Windows/macOS), например:
 `DB_URL=postgresql+asyncpg://user:password@host.docker.internal:5432/your_db`. Либо задайте `PG_HOST=host.docker.internal` и не заполняйте `DB_URL` (тогда URL соберётся из `PG_*`).
 
 ---
