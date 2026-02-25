@@ -18,7 +18,7 @@ class LoginRequest(BaseModel):
 
 
 class OkResponse(BaseModel):
-    """Успешный ответ POST /api/expert/reg/{reg}: статус ok и словарь куков каталога."""
+    """Успешный ответ POST /api/expert/reg/{reg} (опционально ?name=): статус ok и словарь куков каталога."""
     status: str = "ok"
     cookies: Cookies
 

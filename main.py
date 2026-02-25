@@ -3,7 +3,7 @@
 
 Запуск: python main.py. Инициализирует uvicorn с приложением из services.auth_service.app (app).
 Порт задаётся переменной окружения PORT (по умолчанию 8000).
-Обработка запросов: FastAPI-приложение с эндпоинтами /health, /metrics, POST /api/expert/reg/{reg}, GET /api/infoboards/link.
+Обработка запросов: FastAPI-приложение с эндпоинтами /api/expert/health, /api/expert/metrics, POST /api/expert/reg/{reg} (опционально ?name=), GET /api/expert/infoboards/link.
 """
 from __future__ import annotations
 

@@ -40,8 +40,9 @@ class Settings(BaseSettings):
     HTTP_TIMEOUT: float = Field(10.0, description="HTTP timeout seconds")
     LOG_LEVEL: str = Field("INFO", description="Log level")
 
-    PORT: int = Field(8000, description="HTTP server port (Auth API)")
-    AUTH_SERVICE_URL: str = Field("http://127.0.0.1:8000", description="Auth service base URL")
+    # Значения берутся из ENV (PORT, AUTH_SERVICE_URL); ниже — только дефолты при отсутствии переменной
+    PORT: int = Field(8000, description="HTTP server port (Auth API), env: PORT")
+    AUTH_SERVICE_URL: str = Field("http://127.0.0.1:8000", description="Auth service base URL (для воркеров), env: AUTH_SERVICE_URL")
 
     # --- Kafka (единый consumer в unified_worker или отдельные воркеры) ---
     KAFKA_BROKER: str = Field("", description="Kafka broker address")

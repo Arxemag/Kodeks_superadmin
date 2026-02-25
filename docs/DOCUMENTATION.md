@@ -13,8 +13,8 @@
 
 ### 1.2 Потоки данных
 
-- **Логин:** клиент → Auth API `POST /api/expert/reg/{reg}` → БД (base_url по reg) → каталог (POST login) → ответ с cookies.
-- **Инфоборды:** клиент → Auth API `GET /api/infoboards/link?reg=...` → БД, AuthService.login → каталог (GraphQL) → ответ со ссылкой/списком.
+- **Логин:** клиент → Auth API `POST /api/expert/reg/{reg}` или `POST /api/expert/reg/{reg}?name={name}` (без name — куки админа, с name — куки пользователя) → БД (base_url по reg) → каталог (POST login) → ответ с cookies.
+- **Инфоборды:** клиент → Auth API `GET /api/expert/infoboards/link?reg=...` → БД, AuthService.login → каталог (GraphQL) → ответ со ссылкой/списком.
 - **Воркер (Kafka):** сообщение из топика → десериализация JSON → маршрутизация по топику → обработчик (UserService / InitCompanyService / reg_company) → при успехе commit offset; при ошибке — retry или DLQ.
 
 ### 1.3 Зависимости между модулями
@@ -59,7 +59,7 @@
 - **_get_engine()** — создаёт глобальные `_engine` и `_sessionmaker` при первом вызове (один пул на процесс). Использует `get_settings().DB_URL`, `POOL_SIZE`, `POOL_TIMEOUT`.
 - **get_db()** — асинхронный генератор, выдаёт одну сессию на запрос. Используется как FastAPI Depends в эндпоинтах Auth API.
 - **get_db_session()** — контекстный менеджер сессии для воркеров и скриптов. Тот же пул, что и `get_db()`.
-- **healthcheck_db()** — выполняет `SELECT 1`; при ошибке — `DatabaseError`. Вызывается из `GET /health`.
+- **healthcheck_db()** — выполняет `SELECT 1`; при ошибке — `DatabaseError`. Вызывается из `GET /api/expert/health`.
 - **shutdown_db()** — освобождает пул (`engine.dispose()`), обнуляет глобальные переменные. Вызывается при завершении Auth API (lifespan) и воркеров (RegResolver.shutdown).
 
 ### 3.3 `common/kafka.py`
@@ -116,10 +116,10 @@
 - **create_app()** — создаёт FastAPI с lifespan, middleware, обработчиками ошибок и маршрутами.
   - **Middleware:** для каждого запроса увеличивает счётчик активных запросов, выставляет trace_id (из заголовка или новый), замеряет время, прокидывает X-Trace-Id и X-Elapsed-Ms в ответ.
   - **Обработчики:** ServiceError → JSON с code, message и http_status; RequestValidationError → 422; Exception → 500 INTERNAL_ERROR.
-  - **GET /health** — вызывает `healthcheck_db()`, возвращает `{"status": "ok"}`.
-  - **GET /metrics** — Prometheus-метрики (generate_latest).
-  - **POST /api/expert/reg/{reg}** — query-параметр `name` опционально. Передаёт в `AuthService(db, settings).login(reg, name)` и возвращает cookies.
-  - **GET /api/infoboards/link** — query `reg`, опционально `title`. Передаёт в `InfoboardsService(db, settings).get_link_by_reg_and_title(reg, title)` и возвращает ссылку или список кабинетов.
+  - **GET /api/expert/health** — вызывает `healthcheck_db()`, возвращает `{"status": "ok"}`.
+  - **GET /api/expert/metrics** — Prometheus-метрики (generate_latest).
+  - **POST /api/expert/reg/{reg}** — опциональный query-параметр **`name`**: без `name` возвращаются куки админа, с `name` — куки указанного пользователя (пароль запрашивается через админа). Примеры: `POST /api/expert/reg/350832`, `POST /api/expert/reg/350832?name=user1`. Передаёт в `AuthService(db, settings).login(reg, name)` и возвращает cookies.
+  - **GET /api/expert/infoboards/link** — query `reg`, опционально `title`. Передаёт в `InfoboardsService(db, settings).get_link_by_reg_and_title(reg, title)` и возвращает ссылку или список кабинетов.
 
 Взаимодействие: app использует common.db (get_db, healthcheck_db, shutdown_db), common.config (get_settings), common.http (shutdown_http), common.logger, common.exceptions; делегирует логику в AuthService и InfoboardsService.
 

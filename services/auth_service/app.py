@@ -95,13 +95,13 @@ def create_app() -> FastAPI:
             content=ErrorResponse(code="INTERNAL_ERROR", message="Internal error").model_dump(),
         )
 
-    @app.get("/health")
+    @app.get("/api/expert/health")
     async def health():
         """Проверка живости: выполняется healthcheck_db(); при успехе — 200 и {"status": "ok"}."""
         await healthcheck_db()
         return {"status": "ok"}
 
-    @app.get("/metrics")
+    @app.get("/api/expert/metrics")
     async def metrics() -> Response:
         """Эндпоинт Prometheus: отдаёт сгенерированные метрики в текстовом формате."""
         return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
@@ -120,7 +120,7 @@ def create_app() -> FastAPI:
         return OkResponse(cookies=cookies)
 
     @app.get(
-        "/api/infoboards/link",
+        "/api/expert/infoboards/link",
         response_model=InfoboardLinkResponse | InfoboardsListResponse,
         responses={404: {"model": InfoboardsErrorResponse}, 422: {"model": InfoboardsErrorResponse}},
     )

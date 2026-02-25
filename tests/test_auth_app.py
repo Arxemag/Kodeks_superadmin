@@ -80,13 +80,13 @@ def auth_client(mock_settings: Settings, mock_db_session: MagicMock) -> TestClie
 
 
 def test_health(auth_client: TestClient) -> None:
-    r = auth_client.get("/health")
+    r = auth_client.get("/api/expert/health")
     assert r.status_code == 200
     assert r.json() == {"status": "ok"}
 
 
 def test_metrics(auth_client: TestClient) -> None:
-    r = auth_client.get("/metrics")
+    r = auth_client.get("/api/expert/metrics")
     assert r.status_code == 200
     assert "text/plain" in r.headers.get("content-type", "")
 

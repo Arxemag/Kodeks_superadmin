@@ -17,7 +17,7 @@
 
 ## 2. Авторизация: два пути
 
-- **add_cabinet_group.py** (при `--reg`): использует **AuthClient** → POST к Auth API `/api/expert/reg/{reg}` → получает готовые cookies.
+- **add_cabinet_group.py** (при `--reg`): использует **AuthClient** → POST к Auth API `/api/expert/reg/{reg}` (без query `name` — куки админа) → получает готовые cookies.
 - **InitCompanyService** (Kafka): использует **AuthService** → прямой логин в каталог (login.asp) с ADMIN_LOGIN/ADMIN_PASSWORD.
 
 Оба дают админские cookies для каталога. При подключении Kafka важно: AuthService должен иметь те же учётные данные, что и Auth API (или Auth API должен быть единственной точкой входа для админа). Иначе сессия каталога может вести себя иначе (например, другой уровень доступа).

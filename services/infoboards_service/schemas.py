@@ -1,5 +1,5 @@
 """
-Схемы ответов эндпоинта GET /api/infoboards/link.
+Схемы ответов эндпоинта GET /api/expert/infoboards/link.
 
 InfoboardLinkResponse — один кабинет (когда передан title); InfoboardsListResponse — список кабинетов
 (когда title не передан). ErrorResponse — тело ошибки 404/422 для OpenAPI.
