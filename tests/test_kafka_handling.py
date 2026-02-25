@@ -49,6 +49,12 @@ def test_kafka_unwrap_payload_envelope() -> None:
     assert unwrap_payload(envelope) == {"reg": "123", "companyName": "OOO"}
 
 
+def test_kafka_unwrap_payload_json_string() -> None:
+    """unwrap_payload декодирует payload из JSON-строки."""
+    envelope = {"event_id": "e2", "event_type": "create-user", "payload": "{\"reg\": \"456\", \"uid\": \"u1\", \"psw\": \"p\"}"}
+    assert unwrap_payload(envelope) == {"reg": "456", "uid": "u1", "psw": "p"}
+
+
 def test_kafka_unwrap_payload_flat_passthrough() -> None:
     """unwrap_payload возвращает value как есть, если нет ключа payload (обратная совместимость)."""
     flat = {"reg": "123", "companyName": "OOO"}

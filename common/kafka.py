@@ -25,11 +25,14 @@ def _json_serializer(value: Any) -> bytes:
 
 def unwrap_payload(value: Any) -> Any:
     """
-    Если сообщение в формате { event_id, event_type, payload }, вернуть payload;
+    Если сообщение в формате { event_id, event_type, payload }, вернуть payload (декодированный из JSON, если строка);
     иначе вернуть value как есть (обратная совместимость с «плоским» телом).
     """
     if isinstance(value, dict) and "payload" in value:
-        return value["payload"]
+        raw_payload = value["payload"]
+        if isinstance(raw_payload, str):
+            return json.loads(raw_payload)
+        return raw_payload
     return value
 
 
