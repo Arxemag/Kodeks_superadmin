@@ -1,12 +1,13 @@
 """
 Подключение к PostgreSQL и сессии.
 
-Инициализация: движок и фабрика сессий создаются при первом обращении к get_db()
-или healthcheck_db() через _get_engine(). Освобождение ресурсов — в shutdown_db()
-(вызывается при завершении Auth API из lifespan).
+Один пул на процесс: движок и фабрика сессий создаются при первом обращении к get_db(),
+get_db_session() или healthcheck_db() через _get_engine(). Освобождение — shutdown_db()
+(Auth API lifespan или воркеры при завершении).
 """
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
 from sqlalchemy import text
@@ -48,6 +49,18 @@ async def get_db() -> AsyncIterator[AsyncSession]:
     Используется в эндпоинтах Auth API (login, infoboards).
     """
     global _sessionmaker
+    _get_engine()
+    assert _sessionmaker is not None
+    async with _sessionmaker() as session:
+        yield session
+
+
+@asynccontextmanager
+async def get_db_session() -> AsyncIterator[AsyncSession]:
+    """
+    Контекстный менеджер сессии БД для воркеров и скриптов.
+    Использует тот же пул, что и get_db().
+    """
     _get_engine()
     assert _sessionmaker is not None
     async with _sessionmaker() as session:
