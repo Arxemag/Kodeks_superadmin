@@ -40,6 +40,7 @@ class Settings(BaseSettings):
     HTTP_TIMEOUT: float = Field(10.0, description="HTTP timeout seconds")
     LOG_LEVEL: str = Field("INFO", description="Log level")
 
+    PORT: int = Field(8000, description="HTTP server port (Auth API)")
     AUTH_SERVICE_URL: str = Field("http://127.0.0.1:8000", description="Auth service base URL")
 
     # --- Kafka (инициализация consumer/producer в users_service.worker) ---

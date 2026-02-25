@@ -13,6 +13,7 @@ COPY common/ common/
 COPY services/ services/
 COPY main.py main_users.py main_init_company.py main_reg_company.py ./
 
-# По умолчанию — Auth API
+# По умолчанию — Auth API. Порт задаётся через ENV PORT (по умолчанию 8000).
+ENV PORT=8000
 EXPOSE 8000
 CMD ["python", "main.py"]
