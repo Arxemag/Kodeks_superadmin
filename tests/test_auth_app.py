@@ -13,6 +13,7 @@ from services.auth_service.app import create_app
 
 @pytest.fixture
 def mock_settings() -> Settings:
+    """Полный mock настроек для тестов Auth API и воркеров."""
     return Settings.model_construct(
         DB_URL="postgresql+asyncpg://u:p@localhost:5432/testdb",
         PG_HOST="",
@@ -26,10 +27,11 @@ def mock_settings() -> Settings:
         ADMIN_PASSWORD="secret",
         HTTP_TIMEOUT=10.0,
         LOG_LEVEL="INFO",
+        PORT=8000,
         AUTH_SERVICE_URL="http://127.0.0.1:8000",
         KAFKA_BROKER="",
         KAFKA_BOOTSTRAP_SERVERS="127.0.0.1:9092",
-        KAFKA_GROUP_ID="users-service",
+        KAFKA_GROUP_ID="superadmin-workers",
         KAFKA_CREATE_TOPIC="create-user",
         KAFKA_UPDATE_TOPIC="update-user",
         KAFKA_UPDATE_DEPARTMENTS_TOPIC="update-user-departments",
@@ -41,6 +43,15 @@ def mock_settings() -> Settings:
         USERS_RETRY_BASE_DELAY=0.2,
         USERS_RETRY_MAX_DELAY=3.0,
         USERS_METRICS_PORT=9101,
+        KAFKA_INIT_COMPANY_TOPIC="init_company",
+        KAFKA_INIT_COMPANY_DLQ_TOPIC="init_company-dlq",
+        KAFKA_INIT_COMPANY_GROUP_ID="infoboards-init-company",
+        INIT_COMPANY_METRICS_PORT=9102,
+        KAFKA_ENABLE_REG_COMPANY_TOPIC="enable_reg_company",
+        KAFKA_DISABLE_REG_COMPANY_TOPIC="disable_reg_company",
+        KAFKA_REG_COMPANY_GROUP_ID="reg-company",
+        REG_COMPANY_METRICS_PORT=9103,
+        UNIFIED_WORKER_METRICS_PORT=9100,
         AUTH_HARD_TIMEOUT=2.0,
         AUTH_HARD_TIMEOUT_DEBUG=20.0,
     )

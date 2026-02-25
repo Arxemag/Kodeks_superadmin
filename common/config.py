@@ -43,10 +43,11 @@ class Settings(BaseSettings):
     PORT: int = Field(8000, description="HTTP server port (Auth API)")
     AUTH_SERVICE_URL: str = Field("http://127.0.0.1:8000", description="Auth service base URL")
 
-    # --- Kafka (инициализация consumer/producer в users_service.worker) ---
+    # --- Kafka (единый consumer в unified_worker или отдельные воркеры) ---
     KAFKA_BROKER: str = Field("", description="Kafka broker address")
     KAFKA_BOOTSTRAP_SERVERS: str = Field("", description="Kafka bootstrap servers")
-    KAFKA_GROUP_ID: str = Field("users-service", description="Kafka consumer group id")
+    # Одна группа на все топики при использовании unified worker (main_unified_worker.py)
+    KAFKA_GROUP_ID: str = Field("superadmin-workers", description="Kafka consumer group id (unified worker)")
     KAFKA_CREATE_TOPIC: str = Field("create-user", description="Kafka topic for user creation")
     KAFKA_UPDATE_TOPIC: str = Field("update-user", description="Kafka topic for user updates")
     KAFKA_UPDATE_DEPARTMENTS_TOPIC: str = Field(
@@ -97,6 +98,12 @@ class Settings(BaseSettings):
     REG_COMPANY_METRICS_PORT: int = Field(
         9103,
         description="Prometheus metrics port for reg_company worker",
+    )
+
+    # Единый воркер (одна группа, все топики)
+    UNIFIED_WORKER_METRICS_PORT: int = Field(
+        9100,
+        description="Prometheus metrics port for unified Kafka worker",
     )
 
     # Жёсткий таймаут на операцию логина (секунды).
