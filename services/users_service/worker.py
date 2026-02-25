@@ -24,6 +24,7 @@ from pydantic import ValidationError
 from prometheus_client import start_http_server
 
 from common.config import get_settings
+from common.kafka import create_consumer, create_producer
 from common.exceptions import AuthError, NetworkError, ParseError
 from common.logger import get_logger, set_trace_id
 from services.users_service.auth_client import AuthClient
@@ -112,30 +113,19 @@ async def run_worker() -> None:
     signal.signal(signal.SIGINT, _stop_handler)
     signal.signal(signal.SIGTERM, _stop_handler)
 
-    consumer = AIOKafkaConsumer(
+    consumer = create_consumer(
         settings.KAFKA_CREATE_TOPIC,
         settings.KAFKA_UPDATE_TOPIC,
         settings.KAFKA_UPDATE_DEPARTMENTS_TOPIC,
-        bootstrap_servers=settings.KAFKA_BOOTSTRAP_SERVERS,
         group_id=settings.KAFKA_GROUP_ID,
-        enable_auto_commit=False,
-        auto_offset_reset="earliest",
-        value_deserializer=lambda v: json.loads(v.decode("utf-8")),
+        settings=settings,
         max_poll_records=settings.KAFKA_MAX_BATCH,
         request_timeout_ms=40_000,
         session_timeout_ms=15_000,
     )
-    producer = AIOKafkaProducer(
-        bootstrap_servers=settings.KAFKA_BOOTSTRAP_SERVERS,
-        value_serializer=lambda v: json.dumps(v, ensure_ascii=False).encode("utf-8"),
-        request_timeout_ms=30_000,
-    )
+    producer = create_producer(settings=settings)
 
-    resolver = RegResolver(
-        db_url=settings.DB_URL,
-        pool_size=settings.POOL_SIZE,
-        pool_timeout=settings.POOL_TIMEOUT,
-    )
+    resolver = RegResolver()
     await resolver.startup()
 
     async with httpx.AsyncClient(timeout=settings.HTTP_TIMEOUT, follow_redirects=True) as http_client:
