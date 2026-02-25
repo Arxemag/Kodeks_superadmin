@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from services.unified_worker import _all_topics, _dispatch_record
+from services.unified_worker import _all_topics, _dispatch_record, _effective_topic, _records_from_value
 from services.users_service.dto import CreateUserDTO
 from services.users_service.service import UserService
 from tests.conftest import StubAuthClient, StubCatalogClient, StubRegResolver
@@ -46,6 +46,43 @@ def test_all_topics_returns_six_topics(unified_settings: MagicMock) -> None:
     assert topics[3] == "init_company"
     assert topics[4] == "enable_reg_company"
     assert topics[5] == "disable_reg_company"
+
+
+def test_effective_topic_from_record_topic() -> None:
+    """Без event_type в теле используется record.topic."""
+    record = _fake_record("init_company", {"reg": "123"})
+    assert _effective_topic(record) == "init_company"
+
+
+def test_effective_topic_from_event_type() -> None:
+    """При наличии event_type в теле используется он для маршрутизации."""
+    record = _fake_record("any_topic", {"event_id": "e1", "event_type": "init_company", "payload": {"reg": "123"}})
+    assert _effective_topic(record) == "init_company"
+
+
+def test_records_from_value_single() -> None:
+    """Обычное сообщение (не массив) — один record."""
+    record = _fake_record("create-user", {"reg": "1", "uid": "u", "psw": "p"})
+    out = _records_from_value(record)
+    assert len(out) == 1
+    assert out[0] is record
+
+
+def test_records_from_value_array() -> None:
+    """Массив событий — по одному виртуальному record на элемент, topic из event_type."""
+    record = _fake_record(
+        "single_topic",
+        [
+            {"event_type": "init_company", "payload": {"reg": "123"}},
+            {"event_type": "disable_reg_company", "payload": {"reg": "456", "companyName": "OOO"}},
+        ],
+    )
+    out = _records_from_value(record)
+    assert len(out) == 2
+    assert out[0].topic == "init_company"
+    assert out[0].value == {"event_type": "init_company", "payload": {"reg": "123"}}
+    assert out[1].topic == "disable_reg_company"
+    assert out[1].value == {"event_type": "disable_reg_company", "payload": {"reg": "456", "companyName": "OOO"}}
 
 
 @pytest.fixture
@@ -108,6 +145,28 @@ async def test_dispatch_record_update_user_calls_users_handle(
         settings=unified_settings,
     )
     assert catalog.users["u2"].get("mail") == "x@y.z"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_record_init_company_by_event_type(unified_settings: MagicMock) -> None:
+    """Сообщение с event_type=init_company в теле маршрутизируется в init_company даже с другим record.topic."""
+    record = _fake_record(
+        "disable_reg_company",
+        {"event_id": "e1", "event_type": "init_company", "payload": {"reg": "123", "companyName": "OOO", "departments": []}},
+    )
+    with patch("services.unified_worker.init_company_handle", new_callable=AsyncMock) as mock_init:
+        await _dispatch_record(
+            record,
+            user_service=MagicMock(),
+            resolver=MagicMock(),
+            catalog_client=MagicMock(),
+            http_client=MagicMock(),
+            producer=AsyncMock(),
+            settings=unified_settings,
+        )
+        mock_init.assert_called_once()
+        # В handler передаётся тот же record (value с envelope, unwrap внутри)
+        assert mock_init.call_args[0][0].value["event_type"] == "init_company"
 
 
 @pytest.mark.asyncio

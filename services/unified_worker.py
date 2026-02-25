@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import signal
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -43,6 +44,38 @@ def _all_topics(settings: Any) -> list[str]:
     ]
 
 
+def _effective_topic(record: ConsumerRecord) -> str:
+    """Тип события: из event_type в теле сообщения (если есть), иначе Kafka record.topic."""
+    raw = record.value
+    if isinstance(raw, dict) and "event_type" in raw:
+        return str(raw["event_type"])
+    return record.topic
+
+
+def _records_from_value(record: ConsumerRecord) -> list[ConsumerRecord | SimpleNamespace]:
+    """
+    Один Kafka record: если value — массив событий, возвращаем по одному «виртуальному» record на элемент;
+    иначе — один элемент [record]. Маршрутизация по event_type у каждого.
+    """
+    value = record.value
+    if not isinstance(value, list) or len(value) == 0:
+        return [record]
+    out: list[ConsumerRecord | SimpleNamespace] = []
+    for i, item in enumerate(value):
+        if not isinstance(item, dict):
+            continue
+        topic = str(item.get("event_type", record.topic))
+        out.append(
+            SimpleNamespace(
+                value=item,
+                topic=topic,
+                partition=record.partition,
+                offset=record.offset,
+            )
+        )
+    return out if out else [record]
+
+
 async def _dispatch_record(
     record: ConsumerRecord,
     *,
@@ -53,8 +86,8 @@ async def _dispatch_record(
     producer: AIOKafkaProducer,
     settings: Any,
 ) -> None:
-    """Маршрутизация по топику: вызывается нужный обработчик."""
-    topic = record.topic
+    """Маршрутизация по топику: event_type из сообщения (если есть) или record.topic."""
+    topic = _effective_topic(record)
     if topic in (
         settings.KAFKA_CREATE_TOPIC,
         settings.KAFKA_UPDATE_TOPIC,
@@ -86,18 +119,19 @@ async def _process_one_record(
     semaphore: asyncio.Semaphore,
     settings: Any,
 ) -> None:
-    """Одна запись: dispatch, при успешном возврате — commit."""
+    """Одна запись: при массиве событий — по одному dispatch; при успехе — commit."""
     tp = TopicPartition(record.topic, record.partition)
     try:
-        await _dispatch_record(
-            record,
-            user_service=user_service,
-            resolver=resolver,
-            catalog_client=catalog_client,
-            http_client=http_client,
-            producer=producer,
-            settings=settings,
-        )
+        for sub_record in _records_from_value(record):
+            await _dispatch_record(
+                sub_record,
+                user_service=user_service,
+                resolver=resolver,
+                catalog_client=catalog_client,
+                http_client=http_client,
+                producer=producer,
+                settings=settings,
+            )
         commit_map = await tracker.complete_and_build_commit(tp, record.offset)
         await consumer.commit(commit_map)
     except Exception as e:
