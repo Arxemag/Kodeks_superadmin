@@ -24,7 +24,7 @@ from prometheus_client import start_http_server
 
 from common.config import get_settings
 from common.exceptions import AuthError, NetworkError, ParseError
-from common.kafka import create_consumer, create_producer
+from common.kafka import create_consumer, create_producer, unwrap_payload
 from common.logger import get_logger, set_trace_id
 from services.infoboards_service.dto import InitCompanyDTO
 from services.infoboards_service.init_company_service import InitCompanyService
@@ -205,7 +205,7 @@ async def _handle_with_retries(
     settings: Any,
 ) -> None:
     """Валидация, вызов InitCompanyService, retry/DLQ при ошибках."""
-    payload = record.value
+    payload = unwrap_payload(record.value)
     if not isinstance(payload, dict):
         await _send_dlq(
             producer, settings.KAFKA_INIT_COMPANY_DLQ_TOPIC,

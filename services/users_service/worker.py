@@ -24,7 +24,7 @@ from pydantic import ValidationError
 from prometheus_client import start_http_server
 
 from common.config import get_settings
-from common.kafka import create_consumer, create_producer
+from common.kafka import create_consumer, create_producer, unwrap_payload
 from common.exceptions import AuthError, NetworkError, ParseError
 from common.logger import get_logger, set_trace_id
 from services.users_service.auth_client import AuthClient
@@ -225,7 +225,7 @@ async def _handle_with_retries(
     settings: Any,
 ) -> None:
     """Валидация payload, определение топика и вызов handle_create/update/update_departments; при ошибках — DLQ или retry с backoff (AuthError/NetworkError)."""
-    payload_raw = record.value
+    payload_raw = unwrap_payload(record.value)
     if not isinstance(payload_raw, dict):
         await _send_dlq(
             producer,

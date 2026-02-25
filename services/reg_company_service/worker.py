@@ -17,7 +17,7 @@ from pydantic import ValidationError
 from prometheus_client import start_http_server
 
 from common.config import get_settings
-from common.kafka import create_consumer
+from common.kafka import create_consumer, unwrap_payload
 from common.logger import get_logger, set_trace_id
 from services.reg_company_service.dto import DisableRegCompanyDTO, EnableRegCompanyDTO
 
@@ -72,7 +72,8 @@ def _process_one(record: Any, settings: Any) -> None:
     """Валидация payload и лог «принял, всё ок». Реализацию добавим позже."""
     topic = getattr(record, "topic", "")
     offset = getattr(record, "offset", -1)
-    payload = record.value if hasattr(record, "value") else None
+    raw = record.value if hasattr(record, "value") else None
+    payload = unwrap_payload(raw) if raw is not None else None
 
     set_trace_id(f"reg_company-{topic}-{offset}")
 

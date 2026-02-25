@@ -23,6 +23,16 @@ def _json_serializer(value: Any) -> bytes:
     return json.dumps(value, ensure_ascii=False).encode("utf-8")
 
 
+def unwrap_payload(value: Any) -> Any:
+    """
+    Если сообщение в формате { event_id, event_type, payload }, вернуть payload;
+    иначе вернуть value как есть (обратная совместимость с «плоским» телом).
+    """
+    if isinstance(value, dict) and "payload" in value:
+        return value["payload"]
+    return value
+
+
 def create_consumer(
     *topics: str,
     group_id: str,

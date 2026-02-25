@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from common.kafka import create_consumer, create_producer
+from common.kafka import create_consumer, create_producer, unwrap_payload
 from services.infoboards_service.init_company_worker import _handle_with_retries as init_company_handle
 from services.reg_company_service.worker import _process_one as reg_company_process_one
 from services.users_service.dto import CreateUserDTO
@@ -41,6 +41,18 @@ def test_kafka_deserializer_invalid_json_raises() -> None:
     from common.kafka import _json_deserializer
     with pytest.raises((json.JSONDecodeError, ValueError)):
         _json_deserializer(b"not json {")
+
+
+def test_kafka_unwrap_payload_envelope() -> None:
+    """unwrap_payload извлекает payload из обёртки { event_id, event_type, payload }."""
+    envelope = {"event_id": "e1", "event_type": "disable_reg_company", "payload": {"reg": "123", "companyName": "OOO"}}
+    assert unwrap_payload(envelope) == {"reg": "123", "companyName": "OOO"}
+
+
+def test_kafka_unwrap_payload_flat_passthrough() -> None:
+    """unwrap_payload возвращает value как есть, если нет ключа payload (обратная совместимость)."""
+    flat = {"reg": "123", "companyName": "OOO"}
+    assert unwrap_payload(flat) is flat
 
 
 def test_kafka_create_consumer_uses_settings() -> None:
