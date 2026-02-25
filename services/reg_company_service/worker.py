@@ -11,12 +11,13 @@ import json
 import signal
 from typing import Any
 
-from aiokafka import AIOKafkaConsumer, TopicPartition
+from aiokafka import TopicPartition
 from aiokafka.structs import OffsetAndMetadata
 from pydantic import ValidationError
 from prometheus_client import start_http_server
 
 from common.config import get_settings
+from common.kafka import create_consumer
 from common.logger import get_logger, set_trace_id
 from services.reg_company_service.dto import DisableRegCompanyDTO, EnableRegCompanyDTO
 
@@ -42,14 +43,11 @@ async def run_worker() -> None:
     signal.signal(signal.SIGINT, _stop)
     signal.signal(signal.SIGTERM, _stop)
 
-    consumer = AIOKafkaConsumer(
+    consumer = create_consumer(
         settings.KAFKA_ENABLE_REG_COMPANY_TOPIC,
         settings.KAFKA_DISABLE_REG_COMPANY_TOPIC,
-        bootstrap_servers=settings.KAFKA_BOOTSTRAP_SERVERS,
         group_id=settings.KAFKA_REG_COMPANY_GROUP_ID,
-        enable_auto_commit=False,
-        auto_offset_reset="earliest",
-        value_deserializer=lambda v: json.loads(v.decode("utf-8")),
+        settings=settings,
         max_poll_records=min(50, settings.KAFKA_MAX_BATCH),
         request_timeout_ms=60_000,
         session_timeout_ms=30_000,
