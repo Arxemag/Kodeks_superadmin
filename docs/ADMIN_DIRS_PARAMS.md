@@ -66,16 +66,16 @@
 ## Откуда берётся форма
 
 1. **init_company / add_cabinet_group:**  
-   GET /admin/dirs → GET /admin/dir?n=X → POST /admin/dir с setup2=«Настройки сервисов» и дефолтами из `SETUP_DIR_DEFAULTS` (cabinet_acl). В ответе — HTML формы с полями выше.
+   GET /admin/dirs → GET /admin/dir?n=X → POST /admin/dir с setup2=«Настройки сервисов» и дефолтами из `SETUP_DIR_DEFAULTS` (cabinet_acl). В ответе — HTML формы с полями выше. Если форма рендерится через JS и в ответе нет полей `acl_infoboard_*`, **init_company** вызывает **apply_acl_via_browser** (Playwright): форма открывается в браузере, ACL подставляются, отправка идёт из браузера (обход 500 из-за проверки сессии).
 
-2. **Парсинг:**  
-   `parse_full_form_from_html(setup_html)` даёт full_form (все input). При отсутствии acl-полей — fallback `parse_acl_from_html(setup_html)` (init_company).
+2. **Парсинг (HTTP-путь):**  
+   `parse_full_form_from_html(setup_html)` даёт full_form (все input). При отсутствии acl-полей — fallback `parse_acl_from_html(setup_html)` (init_company). Если и тогда полей нет — используется apply_acl_via_browser (см. выше).
 
 3. **Подстановка:**  
    `build_admin_dirs_form(full_form, acl_overrides_safe, extra_board_ids=None)` дополняет форму из `_BASE_PARAMS_FALLBACK` при отсутствии ключа и подставляет только наши acl_infoboard_* / infoboard_* для кабинетов из формы.
 
 4. **Отправка:**  
-   urlencode списка пар (имя, значение), без удаления «пустых» полей. Заголовки: Referer, Origin, Content-Type: application/x-www-form-urlencoded.
+   urlencode списка пар (имя, значение), без удаления «пустых» полей. Заголовки: Referer, Origin, Content-Type: application/x-www-form-urlencoded. При apply_acl_via_browser отправка выполняется из браузера (кнопка «Сохранить»).
 
 ---
 

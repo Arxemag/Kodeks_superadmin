@@ -99,8 +99,8 @@ DTO: `UpdateUserDepartmentsDTO`, `DepartmentDTO` (id, title).
 | companyName | string | нет         | Для `sync_departments` часто не передаётся (по умолчанию "") |
 | departments | array  | нет (по умолчанию []) | Список отделов |
 
-Элемент `departments`: `{ "id": string (UUID), "title": string, "modules": [string, ...] }`.  
-`title` — название группы в каталоге; `modules` — названия кабинетов (инфобордов).
+Элемент `departments`: `{ "id": string (UUID, обязателен), "title": string, "modules": [string, ...] }`.  
+`id` — UUID отдела (обязателен для каждого элемента); `title` — название группы в каталоге; `modules` — названия кабинетов (инфобордов). При отсутствии `id` в логах выводится сообщение «В отделе отсутствует id».
 
 DTO: `InitCompanyDTO`, `DepartmentPayload` (services/infoboards_service/dto.py).
 

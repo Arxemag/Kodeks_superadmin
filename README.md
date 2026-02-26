@@ -61,8 +61,9 @@ docker compose up -d
 ## Требования
 
 - Python 3.12+ (для локальной разработки)
-- PostgreSQL (таблица `reg_services` и др.)
+- PostgreSQL (таблицы `reg_services`, `department_service_mapping`)
 - Kafka (для воркера)
+- Для init_company при JS-форме каталога: Playwright (`pip install playwright` и `playwright install chromium`), иначе возможен 500 при применении ACL
 
 ## Установка и запуск локально
 
@@ -98,7 +99,7 @@ python main_unified_worker.py
 | auth-api | `python main.py`             | 8000                 |
 | worker   | `python main_unified_worker.py` | метрики 9100      |
 
-Единый воркер: одна consumer group (`KAFKA_GROUP_ID`), подписка на все топики (create-user, update-user, init_company, enable_reg_company, disable_reg_company и др.), маршрутизация по `record.topic` внутри процесса.
+Единый воркер: одна consumer group (`KAFKA_GROUP_ID`), подписка на все топики (create-user, update-user, update-user-departments, init_company, sync_departments, enable_reg_company, disable_reg_company). Маршрутизация по эффективному топику: `event_type` из тела сообщения или `record.topic`.
 
 Переменные окружения — из файла `.env` (см. раздел «Деплой на сервер» и `.env.example`).
 
@@ -117,8 +118,8 @@ python main_unified_worker.py
 - `GET /api/expert/health`, `GET /api/expert/metrics`
 
 **Единый Kafka worker** (`main_unified_worker.py`) — одна consumer group, все топики:
-- Топики: `create-user`, `update-user`, `update-user-departments`, `init_company`, `enable_reg_company`, `disable_reg_company`  
-- Внутри: маршрутизация по `record.topic`, те же обработчики (users, init_company, reg_company)  
+- Топики: `create-user`, `update-user`, `update-user-departments`, `init_company`, `sync_departments`, `enable_reg_company`, `disable_reg_company`
+- Маршрутизация по эффективному топику (`event_type` из сообщения или `record.topic`), обработчики: users, init_company (в т.ч. sync_departments), reg_company
 - Метрики на `UNIFIED_WORKER_METRICS_PORT` (9100)
 
 Отдельные воркеры (`main_users.py`, `main_init_company.py`, `main_reg_company.py`) по-прежнему в репозитории — можно запускать их вместо единого, с разными группами (KAFKA_GROUP_ID, KAFKA_INIT_COMPANY_GROUP_ID, KAFKA_REG_COMPANY_GROUP_ID).

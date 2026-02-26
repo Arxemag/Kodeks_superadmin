@@ -34,11 +34,9 @@
 
 ### 3.2 InitCompanyService._apply_acl (Kafka)
 
-- Используется **только HTTP** (httpx): GET /admin/dirs, GET /admin/dir?n=X, POST setup2, парсинг, POST /admin/dirs.
-- **Нет fallback на Playwright.** Если каталог отдаёт форму ACL только через JS (как у вас), ответ POST /admin/dir не содержит `acl_infoboard_*` → `full_form` неполный → POST /admin/dirs может вернуть **500** или сохранить не то.
-
-**Рекомендация перед Kafka:**  
-Либо (a) договориться с каталогом, чтобы ответ POST /admin/dir (setup2) уже содержал все поля формы в HTML, либо (b) добавить в InitCompanyService опциональный fallback на Playwright (флаг в конфиге, например `INIT_COMPANY_USE_BROWSER_FOR_ACL=true`) и вызывать тот же сценарий, что и в скрипте (открыть страницу, setup2, подставить ACL через evaluate, Submit). Вариант (b) усложняет worker (зависимость Playwright, headless в контейнере).
+- Сначала используется **HTTP** (httpx): GET /admin/dirs, GET /admin/dir?n=X, POST setup2, парсинг ответа.
+- **Fallback на Playwright:** если в ответе нет полей `acl_infoboard_*` (форма рендерится через JS), вызывается **apply_acl_via_browser**: открывается страница в Playwright, нажимается «Настройки сервисов», подставляются ACL, форма отправляется из браузера. Так устраняется 500 при POST через httpx из-за проверки сессии каталогом.
+- Требуется `playwright` в requirements и `playwright install chromium`. Без Playwright при JS-форме в логах предупреждение и попытка минимальной формы через httpx (может дать 500).
 
 ---
 
@@ -77,7 +75,7 @@
 ## 8. Зависимости скрипта
 
 - add_cabinet_group.py: httpx, AuthClient, CatalogClient, admin_dirs (parse_*, build_*, acl_to_json, add_group_to_acl_json), common.config, common.exceptions, common.http, common.logger. Для --use-browser: playwright.
-- InitCompanyService: AuthService (логин в каталог), CatalogClient, admin_dirs, RegResolver/БД. Без Playwright.
+- InitCompanyService: AuthService (логин в каталог), CatalogClient, admin_dirs, cabinet_acl (fetch_acl_form_via_http, apply_acl_via_browser), RegResolver/БД. При JS-форме ACL — Playwright (apply_acl_via_browser).
 
 ---
 
@@ -90,9 +88,9 @@
 
 ## 10. Чек-лист перед включением Kafka
 
-- [ ] Убедиться, что POST /admin/dir (setup2) от каталога возвращает в HTML поля acl_infoboard_* (или включить INIT_COMPANY_USE_BROWSER_FOR_ACL и протестировать).
+- [ ] При JS-форме каталога: установить `playwright` и выполнить `playwright install chromium` (init_company использует apply_acl_via_browser при отсутствии acl-полей в HTTP-ответе).
 - [ ] Проверить, что AuthService и Auth API дают эквивалентные админские cookies для одного и того же reg.
-- [ ] В .env заданы KAFKA_* и INIT_COMPANY_*.
+- [ ] В .env заданы KAFKA_* и INIT_COMPANY_* (в т.ч. топик sync_departments обрабатывается тем же обработчиком).
 - [ ] Метрики init_company (порт, Prometheus) не конфликтуют с другими воркерами.
 - [ ] Прогон init_company_probe.py без Kafka на тестовом reg и проверка, что _apply_acl не падает (и по возможности что ACL в каталоге совпадает с ожиданием).
 - [ ] При необходимости — юнит-тесты на admin_dirs (парсинг и сборка формы).

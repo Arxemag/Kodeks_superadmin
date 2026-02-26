@@ -11,7 +11,7 @@
 | service_group_name  | VARCHAR(255) NOT NULL  | Название группы в каталоге = `departments[].title` |
 | reg                 | VARCHAR(50) NOT NULL   | Рег. номер = `dto.reg` |
 | client_id           | VARCHAR(100) NOT NULL  | **ID компании (клиента)** = `dto.id` из payload |
-| client_name         | VARCHAR(255) NOT NULL  | Название компании = `dto.companyName` |
+| client_name         | VARCHAR(255) NOT NULL  | Название компании = `dto.companyName` (при sync_departments может быть "") |
 | mapping_status      | mapping_status_enum    | `'active'` или `'archived'` |
 
 Ограничение: уникальный индекс по `(reg, department_id)` — для одного рега один и тот же `department_id` не повторяется.
@@ -25,7 +25,7 @@
 | service_group_name | `departments[].title` |
 | reg            | `reg` |
 | client_id      | `id` (ID компании/клиента) |
-| client_name    | `companyName` |
+| client_name    | `companyName` (для sync_departments часто не передаётся — в БД пишется "") |
 | mapping_status | `'active'` при insert/update; `'archived'` для отделов, которые убрали из нового payload по этому reg |
 
 ## Пример

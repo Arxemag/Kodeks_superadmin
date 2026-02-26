@@ -9,13 +9,13 @@
 ### 1.1 Компоненты
 
 - **Auth API** (FastAPI) — HTTP-сервис: логин в каталог по `reg`, выдача ссылок на инфоборды. Использует БД (`reg_services`), каталог (HTTP).
-- **Единый Kafka worker** — один процесс с одной consumer group, подписка на все топики; по `record.topic` вызывается нужный обработчик (users, init_company, reg_company). Использует БД, Auth API (для куков), каталог (HTTP), Kafka.
+- **Единый Kafka worker** — один процесс с одной consumer group, подписка на все топики; маршрутизация по эффективному топику (`event_type` из сообщения или `record.topic`) → нужный обработчик (users, init_company/sync_departments, reg_company). Использует БД, Auth API (для куков), каталог (HTTP), Kafka.
 
 ### 1.2 Потоки данных
 
 - **Логин:** клиент → Auth API `POST /api/expert/reg/{reg}` или `POST /api/expert/reg/{reg}?name={name}` (без name — куки админа, с name — куки пользователя) → БД (base_url по reg) → каталог (POST login) → ответ с cookies.
 - **Инфоборды:** клиент → Auth API `GET /api/expert/infoboards/link?reg=...` → БД, AuthService.login → каталог (GraphQL) → ответ со ссылкой/списком.
-- **Воркер (Kafka):** сообщение из топика → десериализация JSON → маршрутизация по топику → обработчик (UserService / InitCompanyService / reg_company) → при успехе commit offset; при ошибке — retry или DLQ.
+- **Воркер (Kafka):** сообщение из топика → десериализация JSON → извлечение payload (`unwrap_payload`), при необходимости `event_type` → маршрутизация по эффективному топику → обработчик (UserService / InitCompanyService / reg_company) → при успехе commit offset; при ошибке — retry или DLQ.
 
 ### 1.3 Зависимости между модулями
 
@@ -40,7 +40,7 @@
 ### 2.3 Отдельные воркеры (опционально)
 
 - **main_users.py** — только топики create-user, update-user, update-user-departments.
-- **main_init_company.py** — только топик init_company.
+- **main_init_company.py** — топики init_company и sync_departments.
 - **main_reg_company.py** — топики enable_reg_company, disable_reg_company.
 
 В продакшене используется единый воркер (`main_unified_worker.py`).
@@ -219,20 +219,20 @@
 - **_sync_groups(base_url, cookies, reg)** — get_groups_page, parse_groups_catalog; для активных service_group_name из маппинга создаёт отсутствующие группы через create_group, возвращает словарь title → group_id.
 - **_get_boards(base_url, cookies)** — делегирует в cabinet_acl.get_boards (GraphQL).
 - **_build_acl_async(reg, groups_dict, boards_dict, dep_id_to_modules)** — SELECT department_id, service_group_name из department_service_mapping по reg (active); для каждого отдела и модуля (board) строит acl_matrix: board_id → список group_id.
-- **_apply_acl(base_url, cookies, acl_matrix, boards_dict)** — admin_dirs: GET /admin/dir?n=X (users), парсинг формы, build_admin_dirs_form с новой матрицей, POST /admin/dirs.
+- **_apply_acl(base_url, cookies, acl_matrix, boards_dict)** — получение формы ACL: `fetch_acl_form_via_http` (GET dirs → GET dir?n=X → POST /admin/dir с setup2). Если в ответе нет полей `acl_infoboard_*` (форма рендерится через JS), вызывается `apply_acl_via_browser` (Playwright: открыть страницу, подставить ACL, отправить форму из браузера). Иначе: парсинг формы, `build_admin_dirs_form`, POST /admin/dirs через httpx.
 
 Взаимодействие: db (reg_services, department_service_mapping), AuthService, CatalogClient, admin_dirs, cabinet_acl, dto, html_parser (parse_groups_catalog).
 
 ### 6.3 `init_company_worker.py`
 
-- **run_worker()** — метрики (INIT_COMPANY_METRICS_PORT), consumer (init_company), producer, RegResolver().startup(). Цикл getmany → _process_record (init_company_handle с retry/DLQ), commit при успехе.
-- **_handle_with_retries(record, resolver, catalog_client, http_client, producer, settings)** — валидация payload и InitCompanyDTO; with_session → InitCompanyService(db, ...).handle(dto); при ошибках (ValidationError, AuthError REG_NOT_FOUND, NetworkError) — DLQ или retry с backoff.
+- **run_worker()** — метрики (INIT_COMPANY_METRICS_PORT), consumer (топики init_company и sync_departments), producer, RegResolver().startup(). Цикл getmany → _process_record (init_company_handle с retry/DLQ), commit при успехе.
+- **_handle_with_retries(record, ...)** — `unwrap_payload(record.value)`, при необходимости обёртка `data` и подстановка `reg`; валидация InitCompanyDTO (при отсутствии `departments[].id` — лог «В отделе отсутствует id»); with_session → InitCompanyService(db, ...).handle(dto); при ошибках (ValidationError, AuthError REG_NOT_FOUND, NetworkError) — DLQ или retry с backoff.
 
 ### 6.4 `admin_dirs.py`, `cabinet_acl.py`, `dto.py`, `schemas.py`, `metrics.py`
 
 - **admin_dirs** — parse_acl_from_html, parse_full_form_from_html, build_admin_dirs_form — работа с HTML-формой /admin/dirs.
-- **cabinet_acl** — get_boards (GraphQL board.many), get_docs_n_from_dirs — получение кабинетов и параметров для формы.
-- **dto** — InitCompanyDTO, DepartmentPayload (Pydantic).
+- **cabinet_acl** — get_boards (GraphQL board.many), get_docs_n_from_dirs, fetch_acl_form_via_http (GET dirs → GET dir?n → POST /admin/dir с setup2), fetch_acl_form_via_browser и apply_acl_via_browser (Playwright: загрузка формы с JS и отправка ACL из браузера).
+- **dto** — InitCompanyDTO (id, reg, companyName опционально, departments), DepartmentPayload (id обязателен — UUID, title, modules); is_missing_department_id_error() для сообщения в лог при отсутствии id в departments.
 - **schemas** — ответы API инфобордов (InfoboardLinkResponse, InfoboardsListResponse и т.д.).
 - **metrics** — init_company_* (active_jobs, dlq_total, failed_total, lag_seconds, processing_histogram, retry_total, total).
 
@@ -253,9 +253,9 @@
 
 ## 8. Единый воркер (`services/unified_worker.py`)
 
-- **_all_topics(settings)** — возвращает список из шести топиков: create-user, update-user, update-user-departments, init_company, enable_reg_company, disable_reg_company.
+- **_all_topics(settings)** — возвращает список из семи топиков: create-user, update-user, update-user-departments, init_company, sync_departments, enable_reg_company, disable_reg_company.
 - **_record_with_effective_topic(record, effective_topic)** — строит виртуальный record с `topic=effective_topic`, чтобы users_handle и reg_company_process_one роутили по event_type при едином топике Kafka.
-- **_dispatch_record(record, ...)** — эффективный топик: `_effective_topic(record)` (event_type из сообщения или record.topic). Для users и reg_company передаётся виртуальный record с этим топиком; вызываются users_handle, init_company_handle, reg_company_process_one. Неизвестный топик — только warning.
+- **_dispatch_record(record, ...)** — эффективный топик: `_effective_topic(record)` = `event_type_from_message(record.value)` из common.kafka или record.topic. Для users и reg_company передаётся виртуальный record с этим топиком (`_record_with_effective_topic`); для init_company и sync_departments — один обработчик init_company_handle. Неизвестный топик — только warning.
 - **_process_one_record(record, ..., consumer, tracker, semaphore, settings)** — register partition/offset в tracker, вызов _dispatch_record; при успешном возврате — tracker.complete_and_build_commit и consumer.commit; при исключении — логирование; в finally — semaphore.release().
 - **run_unified_worker()** — старт метрик (UNIFIED_WORKER_METRICS_PORT), один consumer (create_consumer(*topics, group_id=KAFKA_GROUP_ID)), один producer, RegResolver().startup(), UserService, цикл getmany → для каждой записи create_task(_process_one_record(...)); в конце — consumer.stop(), producer.stop(), resolver.shutdown().
 
@@ -291,6 +291,6 @@
 | UserService | CatalogClient | get_user_page, post_user, get_groups_page, create_group |
 | Воркеры | common.kafka | create_consumer, create_producer |
 | Воркеры | common.db | через RegResolver (get_db_session, shutdown_db) |
-| unified_worker | users_handle, init_company_handle, reg_company_process_one | по record.topic |
+| unified_worker | users_handle, init_company_handle, reg_company_process_one | по эффективному топику (event_type или record.topic) |
 
 Документ можно дополнять при появлении новых модулей или изменении потоков. Для деплоя и переменных окружения см. README и раздел «БД» в нём.
