@@ -197,6 +197,20 @@ async def _process_record(
         semaphore.release()
 
 
+def _normalize_department_item(item: dict[str, Any]) -> dict[str, Any]:
+    """Приводит элемент companyDepartments к виду { id, title, modules } для InitCompanyDTO."""
+    raw_id = item.get("id") or item.get("departmentId")
+    raw_title = item.get("title") or item.get("name") or ""
+    raw_modules = item.get("modules")
+    if not isinstance(raw_modules, list):
+        raw_modules = []
+    return {
+        "id": str(raw_id) if raw_id is not None else None,
+        "title": str(raw_title),
+        "modules": [str(m) for m in raw_modules],
+    }
+
+
 async def _handle_with_retries(
     record: ConsumerRecord,
     resolver: RegResolver,
@@ -206,7 +220,18 @@ async def _handle_with_retries(
     settings: Any,
 ) -> None:
     """Валидация, вызов InitCompanyService, retry/DLQ при ошибках."""
-    payload = unwrap_payload(record.value)
+    raw_value = record.value
+    # Что реально пришло из Kafka (включите DEBUG, чтобы увидеть, почему нет reg)
+    if isinstance(raw_value, dict):
+        logger.debug(
+            "init_company raw message keys=%s payload_keys=%s",
+            list(raw_value.keys()),
+            list(raw_value["payload"].keys()) if isinstance(raw_value.get("payload"), dict) else type(raw_value.get("payload")).__name__,
+        )
+    else:
+        logger.debug("init_company raw value type=%s", type(raw_value).__name__)
+
+    payload = unwrap_payload(raw_value)
     if not isinstance(payload, dict):
         await _send_dlq(
             producer, settings.KAFKA_INIT_COMPANY_DLQ_TOPIC,
@@ -219,12 +244,30 @@ async def _handle_with_retries(
     if "data" in payload and isinstance(payload.get("data"), dict) and payload.get("reg") is None:
         payload = payload["data"]
 
-    # Подстановка reg из типичных альтернативных ключей, если пришло под другим именем
+    # Подстановка reg из типичных альтернативных ключей (формат продюсера может отличаться)
     if payload.get("reg") is None:
-        for key in ("registration", "reg_number", "regNumber", "companyReg"):
+        for key in (
+            "registration", "reg_number", "regNumber", "companyReg",
+            "registrationNumber", "company_reg", "companyRegNumber", "reg_id",
+        ):
             if payload.get(key) is not None:
                 payload = {**payload, "reg": str(payload[key])}
                 break
+
+    # Подстановка id из альтернативных ключей
+    if payload.get("id") is None:
+        for key in ("companyId", "company_id"):
+            if payload.get(key) is not None:
+                payload = {**payload, "id": int(payload[key])}
+                break
+
+    # Нормализация: companyDepartments → departments (продюсер может слать только companyDepartments)
+    if payload.get("departments") is None and payload.get("companyDepartments") is not None:
+        raw = payload.get("companyDepartments")
+        if isinstance(raw, list):
+            normalized = [_normalize_department_item(d) for d in raw if isinstance(d, dict)]
+            # только элементы с заданным id (без id валидация DTO всё равно упадёт)
+            payload = {**payload, "departments": [x for x in normalized if x.get("id") is not None]}
 
     set_trace_id(f"init_company-{record.topic}-{record.partition}-{record.offset}")
     logger.info(f"processing init_company offset={record.offset} reg={payload.get('reg')!r}")

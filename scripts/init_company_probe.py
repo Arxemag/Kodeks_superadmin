@@ -93,6 +93,43 @@ def _load_json_from_inline_or_file(inline: str, file_path: str) -> dict[str, Any
     return json.loads(_normalize_json_string(raw))
 
 
+def _normalize_department_item(item: dict[str, Any]) -> dict[str, Any]:
+    """Приводит элемент companyDepartments к виду { id, title, modules } (как в воркере)."""
+    raw_id = item.get("id") or item.get("departmentId")
+    raw_title = item.get("title") or item.get("name") or ""
+    raw_modules = item.get("modules")
+    if not isinstance(raw_modules, list):
+        raw_modules = []
+    return {
+        "id": str(raw_id) if raw_id is not None else None,
+        "title": str(raw_title),
+        "modules": [str(m) for m in raw_modules],
+    }
+
+
+def _normalize_init_company_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Единая нормализация payload (reg/id fallback, companyDepartments → departments)."""
+    if payload.get("reg") is None:
+        for key in (
+            "registration", "reg_number", "regNumber", "companyReg",
+            "registrationNumber", "company_reg", "companyRegNumber", "reg_id",
+        ):
+            if payload.get(key) is not None:
+                payload = {**payload, "reg": str(payload[key])}
+                break
+    if payload.get("id") is None:
+        for key in ("companyId", "company_id"):
+            if payload.get(key) is not None:
+                payload = {**payload, "id": int(payload[key])}
+                break
+    if payload.get("departments") is None and payload.get("companyDepartments") is not None:
+        raw = payload.get("companyDepartments")
+        if isinstance(raw, list):
+            normalized = [_normalize_department_item(d) for d in raw if isinstance(d, dict)]
+            payload = {**payload, "departments": [x for x in normalized if x.get("id") is not None]}
+    return payload
+
+
 def _payload_from_args(args: argparse.Namespace) -> dict[str, Any]:
     """Возвращает payload для InitCompanyDTO: из сообщения Kafka (unwrap + data + reg fallback) или flat."""
     use_message = bool(args.message_json or args.message_file)
@@ -120,13 +157,7 @@ def _payload_from_args(args: argparse.Namespace) -> dict[str, Any]:
         # Та же логика, что в воркере: обёртка payload.data
         if "data" in payload and isinstance(payload.get("data"), dict) and payload.get("reg") is None:
             payload = payload["data"]
-        # reg из альтернативных ключей
-        if payload.get("reg") is None:
-            for key in ("registration", "reg_number", "regNumber", "companyReg"):
-                if payload.get(key) is not None:
-                    payload = {**payload, "reg": str(payload[key])}
-                    break
-        return payload
+        return _normalize_init_company_payload(payload)
 
     if bool(args.payload_json) == bool(args.payload_file):
         raise ValueError("Ровно один из --payload-json или --payload-file")
@@ -138,7 +169,7 @@ def _payload_from_args(args: argparse.Namespace) -> dict[str, Any]:
         ) from e
     if not isinstance(payload, dict):
         raise ValueError("Payload должен быть JSON-объектом")
-    return payload
+    return _normalize_init_company_payload(payload)
 
 
 async def _run() -> None:
