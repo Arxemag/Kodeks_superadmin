@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import re
 from functools import lru_cache
 
 from pydantic import Field, model_validator
@@ -32,6 +33,15 @@ class Settings(BaseSettings):
     PG_DATABASE: str = Field("", description="PostgreSQL database name")
     POOL_SIZE: int = Field(10, description="DB pool size")
     POOL_TIMEOUT: int = Field(30, description="DB pool timeout seconds")
+    # Имена таблиц БД (из ENV для гибкой подстройки под разные схемы)
+    DB_TABLE_REG_SERVICES: str = Field(
+        "reg_services",
+        description="Таблица reg_number -> base_url каталога, env: DB_TABLE_REG_SERVICES",
+    )
+    DB_TABLE_DEPARTMENT_MAPPING: str = Field(
+        "department_service_mapping",
+        description="Таблица маппинга отделов/кабинетов, env: DB_TABLE_DEPARTMENT_MAPPING",
+    )
 
     # --- Учётные данные каталога (используются в auth_service при логине) ---
     ADMIN_LOGIN: str = Field(..., description="Catalog admin login")
@@ -134,6 +144,14 @@ class Settings(BaseSettings):
             raise ValueError(
                 "DB_URL is empty; set DB_URL or all of PG_HOST, PG_USERNAME, PG_PASSWORD, PG_DATABASE"
             )
+        # Имена таблиц — только безопасные идентификаторы (защита от SQL injection из ENV)
+        safe = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+        for name, val in (
+            ("DB_TABLE_REG_SERVICES", self.DB_TABLE_REG_SERVICES),
+            ("DB_TABLE_DEPARTMENT_MAPPING", self.DB_TABLE_DEPARTMENT_MAPPING),
+        ):
+            if not safe.match(val):
+                raise ValueError(f"{name} must be a valid table name (letters, digits, underscore): {val!r}")
         return self
 
 

@@ -12,12 +12,13 @@ from typing import AsyncIterator
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from common.config import get_settings
 from common.db import get_db_session, shutdown_db
 from common.exceptions import AuthError
 
 
 class RegResolver:
-    """По reg возвращает base_url каталога из reg_services. Пул БД — общий (common.db)."""
+    """По reg возвращает base_url каталога из таблицы (DB_TABLE_REG_SERVICES). Пул БД — общий (common.db)."""
 
     async def startup(self) -> None:
         """Инициализирует общий пул БД при первом обращении (ленивая инициализация в get_db_session)."""
@@ -29,10 +30,12 @@ class RegResolver:
         await shutdown_db()
 
     async def resolve_base_url(self, reg: str) -> str:
-        """Читает base_url из reg_services по reg_number; при отсутствии — AuthError REG_NOT_FOUND. Возвращает URL без завершающего слэша."""
+        """Читает base_url из таблицы (DB_TABLE_REG_SERVICES) по reg_number; при отсутствии — AuthError REG_NOT_FOUND."""
+        settings = get_settings()
+        tbl = settings.DB_TABLE_REG_SERVICES
         async with get_db_session() as session:
             result = await session.execute(
-                text("SELECT base_url FROM reg_services WHERE reg_number = :reg"),
+                text(f"SELECT base_url FROM {tbl} WHERE reg_number = :reg"),
                 {"reg": reg},
             )
             value = result.scalar_one_or_none()

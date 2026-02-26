@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from services.unified_worker import _all_topics, _dispatch_record, _effective_topic, _records_from_value
+from services.unified_worker import _all_topics, _dispatch_record, _effective_topic, _event_type_from_value, _records_from_value
 from services.users_service.dto import CreateUserDTO
 from services.users_service.service import UserService
 from tests.conftest import StubAuthClient, StubCatalogClient, StubRegResolver
@@ -58,6 +58,16 @@ def test_effective_topic_from_event_type() -> None:
     """При наличии event_type в теле используется он для маршрутизации."""
     record = _fake_record("any_topic", {"event_id": "e1", "event_type": "init_company", "payload": {"reg": "123"}})
     assert _effective_topic(record) == "init_company"
+
+
+def test_effective_topic_from_event_type_inside_payload() -> None:
+    """event_type только внутри payload — используется для маршрутизации."""
+    record = _fake_record(
+        "other_topic",
+        {"event_id": "e1", "payload": {"event_type": "init_company", "reg": "123", "companyName": "OOO"}},
+    )
+    assert _effective_topic(record) == "init_company"
+    assert _event_type_from_value(record.value) == "init_company"
 
 
 def test_records_from_value_single() -> None:

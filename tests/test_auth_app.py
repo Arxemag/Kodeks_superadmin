@@ -23,6 +23,8 @@ def mock_settings() -> Settings:
         PG_DATABASE="",
         POOL_SIZE=1,
         POOL_TIMEOUT=5,
+        DB_TABLE_REG_SERVICES="reg_services",
+        DB_TABLE_DEPARTMENT_MAPPING="department_service_mapping",
         ADMIN_LOGIN="admin",
         ADMIN_PASSWORD="secret",
         HTTP_TIMEOUT=10.0,
@@ -69,7 +71,7 @@ def auth_client(mock_settings: Settings, mock_db_session: MagicMock) -> TestClie
     get_settings.cache_clear()
     with (
         patch("services.auth_service.app.get_settings", return_value=mock_settings),
-        patch("common.db.healthcheck_db", new_callable=AsyncMock),
+        patch("services.auth_service.app.healthcheck_db", new_callable=AsyncMock),
         patch("common.db.shutdown_db", new_callable=AsyncMock),
         patch("common.http.shutdown_http", new_callable=AsyncMock),
     ):

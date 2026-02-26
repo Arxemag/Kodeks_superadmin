@@ -119,9 +119,10 @@ class InfoboardsService:
         raise ParseError(code="INFOBOARD_NOT_FOUND", message=f"Infoboard with title {title!r} not found")
 
     async def _get_base_url(self, reg: str) -> str:
-        """Чтение base_url из reg_services по reg_number; при отсутствии — AuthError REG_NOT_FOUND."""
+        """Чтение base_url из таблицы (DB_TABLE_REG_SERVICES) по reg_number; при отсутствии — AuthError REG_NOT_FOUND."""
+        tbl = self.settings.DB_TABLE_REG_SERVICES
         res = await self.db.execute(
-            text("SELECT base_url FROM reg_services WHERE reg_number = :reg"),
+            text(f"SELECT base_url FROM {tbl} WHERE reg_number = :reg"),
             {"reg": reg},
         )
         base_url = res.scalar_one_or_none()

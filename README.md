@@ -155,18 +155,18 @@ pytest tests -v
 
 ## БД
 
-Требуется **PostgreSQL**. Схему создаёт `scripts/init_db.py` (читает SQL из `scripts/migrations/` по порядку).
+Требуется **PostgreSQL**. Схему создаёт `scripts/init_db.py` (читает SQL из `scripts/migrations/` по порядку). Имена таблиц задаются через ENV: `DB_TABLE_REG_SERVICES` (по умолчанию `reg_services`), `DB_TABLE_DEPARTMENT_MAPPING` (по умолчанию `department_service_mapping`) — для подстройки под разные схемы БД.
 
 ### Таблицы и колонки
 
-**1. `reg_services`** — соответствие рега и базового URL каталога (используют Auth API, воркеры).
+**1. `reg_services`** (или значение `DB_TABLE_REG_SERVICES`) — соответствие рега и базового URL каталога (используют Auth API, воркеры).
 
 | Колонка     | Тип   | Ограничения   | Описание                    |
 |-------------|-------|---------------|-----------------------------|
 | `reg_number`| `text`| PRIMARY KEY   | Код рега (например 350832)  |
 | `base_url`  | `text`| NOT NULL      | URL каталога без завершающего `/` |
 
-**2. `department_service_mapping`** — маппинг отделов компании на группы в каталоге (использует init_company).
+**2. `department_service_mapping`** (или значение `DB_TABLE_DEPARTMENT_MAPPING`) — маппинг отделов компании на группы в каталоге (использует init_company).
 
 Перед таблицей создаётся enum: `mapping_status_enum` — значения `'active'`, `'archived'`.
 

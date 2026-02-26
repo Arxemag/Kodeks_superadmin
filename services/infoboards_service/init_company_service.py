@@ -92,8 +92,9 @@ class InitCompanyService:
 
     async def _get_base_url(self, reg: str) -> str:
         """Base_url по reg; при отсутствии — AuthError REG_NOT_FOUND (DLQ)."""
+        tbl = self.settings.DB_TABLE_REG_SERVICES
         res = await self.db.execute(
-            text("SELECT base_url FROM reg_services WHERE reg_number = :reg"),
+            text(f"SELECT base_url FROM {tbl} WHERE reg_number = :reg"),
             {"reg": reg},
         )
         value = res.scalar_one_or_none()
@@ -103,15 +104,16 @@ class InitCompanyService:
 
     async def _sync_mapping_table(self, reg: str, dto: InitCompanyDTO) -> None:
         """3.1–3.3: select, insert/update, archive."""
+        tbl = self.settings.DB_TABLE_DEPARTMENT_MAPPING
         client_id = str(dto.id)
         company_name = dto.companyName
         incoming_ids = {str(d.id) for d in dto.departments}
 
         # 3.1 Существующие записи
         res = await self.db.execute(
-            text("""
+            text(f"""
                 SELECT id, department_id::text, service_group_name, reg, client_id, client_name, mapping_status
-                FROM department_service_mapping WHERE reg = :reg
+                FROM {tbl} WHERE reg = :reg
             """),
             {"reg": reg},
         )
@@ -124,8 +126,8 @@ class InitCompanyService:
             title = dept.title
             if dept_id in existing:
                 await self.db.execute(
-                    text("""
-                        UPDATE department_service_mapping
+                    text(f"""
+                        UPDATE {tbl}
                         SET service_group_name = :title, client_name = :company_name, mapping_status = 'active'
                         WHERE reg = :reg AND department_id = :dept_id
                     """),
@@ -133,8 +135,8 @@ class InitCompanyService:
                 )
             else:
                 await self.db.execute(
-                    text("""
-                        INSERT INTO department_service_mapping
+                    text(f"""
+                        INSERT INTO {tbl}
                         (department_id, service_group_name, reg, client_id, client_name, mapping_status)
                         VALUES (:dept_id, :title, :reg, :client_id, :company_name, 'active')
                     """),
@@ -151,8 +153,8 @@ class InitCompanyService:
         to_archive = existing.keys() - incoming_ids
         if to_archive:
             from sqlalchemy import bindparam
-            stmt = text("""
-                UPDATE department_service_mapping
+            stmt = text(f"""
+                UPDATE {tbl}
                 SET mapping_status = 'archived'
                 WHERE reg = :reg AND mapping_status = 'active'
                 AND department_id::text IN :ids
@@ -167,9 +169,10 @@ class InitCompanyService:
         html = await self.catalog_client.get_groups_page(base_url, cookies)
         groups: dict[str, int] = parse_groups_catalog(html)
 
+        tbl = self.settings.DB_TABLE_DEPARTMENT_MAPPING
         res = await self.db.execute(
-            text("""
-                SELECT service_group_name FROM department_service_mapping
+            text(f"""
+                SELECT service_group_name FROM {tbl}
                 WHERE reg = :reg AND mapping_status = 'active'
             """),
             {"reg": reg},
@@ -213,10 +216,11 @@ class InitCompanyService:
         dep_id_to_modules: dict[str, list[str]],
     ) -> dict[str, list[int]]:
         """5.2: board_id -> [group_ids]."""
+        tbl = self.settings.DB_TABLE_DEPARTMENT_MAPPING
         res = await self.db.execute(
-            text("""
+            text(f"""
                 SELECT department_id::text, service_group_name
-                FROM department_service_mapping
+                FROM {tbl}
                 WHERE reg = :reg AND mapping_status = 'active'
             """),
             {"reg": reg},

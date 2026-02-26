@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import signal
 from types import SimpleNamespace
 from typing import Any
@@ -44,12 +45,29 @@ def _all_topics(settings: Any) -> list[str]:
     ]
 
 
+def _event_type_from_value(value: Any) -> str | None:
+    """Извлекает event_type: с верхнего уровня или из вложенного payload (dict или JSON-строка)."""
+    if not isinstance(value, dict):
+        return None
+    if "event_type" in value:
+        return str(value["event_type"])
+    if "payload" not in value:
+        return None
+    payload = value["payload"]
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except (TypeError, ValueError):
+            return None
+    if isinstance(payload, dict) and "event_type" in payload:
+        return str(payload["event_type"])
+    return None
+
+
 def _effective_topic(record: ConsumerRecord) -> str:
-    """Тип события: из event_type в теле сообщения (если есть), иначе Kafka record.topic."""
-    raw = record.value
-    if isinstance(raw, dict) and "event_type" in raw:
-        return str(raw["event_type"])
-    return record.topic
+    """Тип события: из event_type (верхний уровень или внутри payload), иначе Kafka record.topic."""
+    topic = _event_type_from_value(record.value)
+    return topic if topic else record.topic
 
 
 def _records_from_value(record: ConsumerRecord) -> list[ConsumerRecord | SimpleNamespace]:
@@ -64,7 +82,7 @@ def _records_from_value(record: ConsumerRecord) -> list[ConsumerRecord | SimpleN
     for i, item in enumerate(value):
         if not isinstance(item, dict):
             continue
-        topic = str(item.get("event_type", record.topic))
+        topic = _event_type_from_value(item) or record.topic
         out.append(
             SimpleNamespace(
                 value=item,
@@ -88,6 +106,7 @@ async def _dispatch_record(
 ) -> None:
     """Маршрутизация по топику: event_type из сообщения (если есть) или record.topic."""
     topic = _effective_topic(record)
+    logger.debug("dispatch record kafka_topic=%s effective_topic=%s offset=%s", record.topic, topic, record.offset)
     if topic in (
         settings.KAFKA_CREATE_TOPIC,
         settings.KAFKA_UPDATE_TOPIC,

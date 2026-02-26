@@ -292,11 +292,12 @@ async def _get_base_url(reg: str) -> str:
     from sqlalchemy.ext.asyncio import AsyncSession
 
     settings = get_settings()
+    tbl = settings.DB_TABLE_REG_SERVICES
     engine = create_async_engine(settings.DB_URL, pool_size=1)
     sm = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     async with sm() as session:
         res = await session.execute(
-            text("SELECT base_url FROM reg_services WHERE reg_number = :r"),
+            text(f"SELECT base_url FROM {tbl} WHERE reg_number = :r"),
             {"r": reg},
         )
         val = res.scalar_one_or_none()

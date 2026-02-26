@@ -43,6 +43,9 @@ async def _run() -> None:
     if not db_url:
         raise SystemExit("DB_URL не задан (проверьте .env)")
 
+    tbl_reg = settings.DB_TABLE_REG_SERVICES
+    tbl_dsm = settings.DB_TABLE_DEPARTMENT_MAPPING
+
     migrations_dir = Path(__file__).parent / "migrations"
     migrations = sorted(migrations_dir.glob("*.sql"))
     if not migrations:
@@ -54,24 +57,25 @@ async def _run() -> None:
         pool_pre_ping=True,
     )
 
-    print(f"Подключение к БД...")
+    print(f"Подключение к БД (таблицы: {tbl_reg!r}, {tbl_dsm!r})...")
     async with engine.begin() as conn:
         for m in migrations:
             sql = m.read_text(encoding="utf-8")
+            sql = sql.replace("reg_services", tbl_reg).replace("department_service_mapping", tbl_dsm)
             print(f"  Выполняю {m.name}...")
             await conn.execute(text(sql))
 
     if args.seed:
         async with engine.begin() as conn:
             await conn.execute(
-                text("""
-                    INSERT INTO reg_services (reg_number, base_url)
+                text(f"""
+                    INSERT INTO {tbl_reg} (reg_number, base_url)
                     VALUES (:reg, :base_url)
                     ON CONFLICT (reg_number) DO UPDATE SET base_url = EXCLUDED.base_url
                 """),
                 {"reg": args.reg, "base_url": args.base_url},
             )
-        print(f"  reg={args.reg!r} добавлен в reg_services")
+        print(f"  reg={args.reg!r} добавлен в {tbl_reg}")
 
     await engine.dispose()
     print("Готово.")

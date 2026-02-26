@@ -229,6 +229,10 @@ async def _handle_with_retries(
             init_company_failed_total.labels(reason="validation").inc()
             return
 
+        logger.info(
+            "init_company DTO validated reg=%r id=%r companyName=%r departments=%s",
+            dto.reg, dto.id, dto.companyName, len(dto.departments),
+        )
         async with resolver.with_session() as session:
             service = InitCompanyService(
                 db=session,
