@@ -45,6 +45,14 @@
 
 В продакшене используется единый воркер (`main_unified_worker.py`).
 
+### 2.4 Деплой и скрипты-пробники
+
+- **На деплое скриптов нет** — в контуре только Kafka и воркер(ы). Запуск: `main_unified_worker.py` (один процесс на все топики) или отдельно `main_users.py`, `main_init_company.py`, `main_reg_company.py`.
+- **Скрипты `scripts/*_probe.py`** — только для локальных/интеграционных тестов без Kafka. Они вызывают **те же сервисы** и **ту же нормализацию payload**, что и воркеры:
+  - **init_company:** `unwrap_payload` → обёртка `data` → подстановка `reg` из альтернативных ключей → `InitCompanyDTO.model_validate` → `InitCompanyService.handle(dto)`. Воркер (`_handle_with_retries`) делает то же самое; единственное отличие — пробник поддерживает `--dry-run`.
+  - **users:** `event_type_from_message` + `unwrap_payload` → по event_type вызывается `UserService.handle_create` / `handle_update` / `handle_update_departments`. Воркер использует `unwrap_payload(record.value)` и роутит по `record.topic`; в едином воркере в `record.topic` подставляется эффективный топик из `event_type`, чтобы при отправке в один топик Kafka маршрутизация совпадала с пробником.
+- **Формат сообщения Kafka:** либо `{ "event_id", "event_type", "payload" }` (и при необходимости `event_type` внутри `payload`), либо плоский payload. `common.kafka`: `unwrap_payload`, `event_type_from_message` — единая точка разбора для воркеров и пробников.
+
 ---
 
 ## 3. Модуль `common`
@@ -66,6 +74,8 @@
 
 - **_json_deserializer(raw: bytes)** — `json.loads(raw.decode("utf-8"))`. Используется как value_deserializer в consumer.
 - **_json_serializer(value)** — `json.dumps(..., ensure_ascii=False).encode("utf-8")`. Используется как value_serializer в producer.
+- **unwrap_payload(value)** — если value это dict с ключом `payload`, возвращает payload (при необходимости декодированный из JSON-строки); иначе возвращает value. Используется во всех воркерах (init_company, users, reg_company) и в скриптах-пробниках для единообразного извлечения тела сообщения.
+- **event_type_from_message(value)** — извлекает `event_type` с верхнего уровня или из вложенного `payload`. Используется в unified_worker и в users_real_probe для маршрутизации по типу события.
 - **create_consumer(*topics, group_id, settings=..., max_poll_records=..., ...)** — создаёт `AIOKafkaConsumer` с `bootstrap_servers` из settings, JSON-десериализацией, `enable_auto_commit=False`, `auto_offset_reset="earliest"`. Остальные параметры — из конфига или kwargs.
 - **create_producer(settings=..., ...)** — создаёт `AIOKafkaProducer` с bootstrap из settings и JSON-сериализацией.
 
@@ -244,7 +254,8 @@
 ## 8. Единый воркер (`services/unified_worker.py`)
 
 - **_all_topics(settings)** — возвращает список из шести топиков: create-user, update-user, update-user-departments, init_company, enable_reg_company, disable_reg_company.
-- **_dispatch_record(record, user_service, resolver, catalog_client, http_client, producer, settings)** — по record.topic вызывает: users_handle (для create-user, update-user, update-user-departments), init_company_handle (для init_company), reg_company_process_one (для enable_reg_company, disable_reg_company). Неизвестный топик — только warning.
+- **_record_with_effective_topic(record, effective_topic)** — строит виртуальный record с `topic=effective_topic`, чтобы users_handle и reg_company_process_one роутили по event_type при едином топике Kafka.
+- **_dispatch_record(record, ...)** — эффективный топик: `_effective_topic(record)` (event_type из сообщения или record.topic). Для users и reg_company передаётся виртуальный record с этим топиком; вызываются users_handle, init_company_handle, reg_company_process_one. Неизвестный топик — только warning.
 - **_process_one_record(record, ..., consumer, tracker, semaphore, settings)** — register partition/offset в tracker, вызов _dispatch_record; при успешном возврате — tracker.complete_and_build_commit и consumer.commit; при исключении — логирование; в finally — semaphore.release().
 - **run_unified_worker()** — старт метрик (UNIFIED_WORKER_METRICS_PORT), один consumer (create_consumer(*topics, group_id=KAFKA_GROUP_ID)), один producer, RegResolver().startup(), UserService, цикл getmany → для каждой записи create_task(_process_one_record(...)); в конце — consumer.stop(), producer.stop(), resolver.shutdown().
 

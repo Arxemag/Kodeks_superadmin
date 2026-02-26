@@ -1,0 +1,16 @@
+{
+  "event_id": "e1",
+  "event_type": "init_company",
+  "payload": {
+    "id": 67,
+    "reg": "350832",
+    "companyName": "ООО Ромашка",
+    "departments": [
+      {
+        "id": "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11",
+        "title": "TESTPOPOV",
+        "modules": ["Заведующий лабораторией", "TEST"]
+      }
+    ]
+  }
+}

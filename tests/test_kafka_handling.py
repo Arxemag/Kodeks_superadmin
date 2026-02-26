@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from common.kafka import create_consumer, create_producer, unwrap_payload
+from common.kafka import create_consumer, create_producer, event_type_from_message, unwrap_payload
 from services.infoboards_service.init_company_worker import _handle_with_retries as init_company_handle
 from services.reg_company_service.worker import _process_one as reg_company_process_one
 from services.users_service.dto import CreateUserDTO
@@ -59,6 +59,24 @@ def test_kafka_unwrap_payload_flat_passthrough() -> None:
     """unwrap_payload возвращает value как есть, если нет ключа payload (обратная совместимость)."""
     flat = {"reg": "123", "companyName": "OOO"}
     assert unwrap_payload(flat) is flat
+
+
+def test_kafka_event_type_from_message_top_level() -> None:
+    """event_type извлекается с верхнего уровня сообщения."""
+    msg = {"event_id": "e1", "event_type": "create-user", "payload": {"reg": "350832", "uid": "u1"}}
+    assert event_type_from_message(msg) == "create-user"
+
+
+def test_kafka_event_type_from_message_inside_payload() -> None:
+    """event_type извлекается из вложенного payload (dict)."""
+    msg = {"event_id": "e2", "payload": {"event_type": "init_company", "reg": "123", "id": 67}}
+    assert event_type_from_message(msg) == "init_company"
+
+
+def test_kafka_event_type_from_message_no_event_type_returns_none() -> None:
+    """Без event_type возвращается None."""
+    assert event_type_from_message({"payload": {"reg": "123"}}) is None
+    assert event_type_from_message({"reg": "123"}) is None
 
 
 def test_kafka_create_consumer_uses_settings() -> None:

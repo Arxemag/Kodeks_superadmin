@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import signal
 from types import SimpleNamespace
 from typing import Any
@@ -19,7 +18,7 @@ from prometheus_client import start_http_server
 
 from common.config import get_settings
 from common.http import _default_headers
-from common.kafka import create_consumer, create_producer
+from common.kafka import create_consumer, create_producer, event_type_from_message
 from common.logger import get_logger
 from services.infoboards_service.init_company_worker import _handle_with_retries as init_company_handle
 from services.reg_company_service.worker import _process_one as reg_company_process_one
@@ -40,33 +39,15 @@ def _all_topics(settings: Any) -> list[str]:
         settings.KAFKA_UPDATE_TOPIC,
         settings.KAFKA_UPDATE_DEPARTMENTS_TOPIC,
         settings.KAFKA_INIT_COMPANY_TOPIC,
+        settings.KAFKA_SYNC_DEPARTMENTS_TOPIC,
         settings.KAFKA_ENABLE_REG_COMPANY_TOPIC,
         settings.KAFKA_DISABLE_REG_COMPANY_TOPIC,
     ]
 
 
-def _event_type_from_value(value: Any) -> str | None:
-    """Извлекает event_type: с верхнего уровня или из вложенного payload (dict или JSON-строка)."""
-    if not isinstance(value, dict):
-        return None
-    if "event_type" in value:
-        return str(value["event_type"])
-    if "payload" not in value:
-        return None
-    payload = value["payload"]
-    if isinstance(payload, str):
-        try:
-            payload = json.loads(payload)
-        except (TypeError, ValueError):
-            return None
-    if isinstance(payload, dict) and "event_type" in payload:
-        return str(payload["event_type"])
-    return None
-
-
 def _effective_topic(record: ConsumerRecord) -> str:
-    """Тип события: из event_type (верхний уровень или внутри payload), иначе Kafka record.topic."""
-    topic = _event_type_from_value(record.value)
+    """Тип события: из event_type (common.kafka), иначе Kafka record.topic."""
+    topic = event_type_from_message(record.value)
     return topic if topic else record.topic
 
 
@@ -82,7 +63,7 @@ def _records_from_value(record: ConsumerRecord) -> list[ConsumerRecord | SimpleN
     for i, item in enumerate(value):
         if not isinstance(item, dict):
             continue
-        topic = _event_type_from_value(item) or record.topic
+        topic = event_type_from_message(item) or record.topic
         out.append(
             SimpleNamespace(
                 value=item,
@@ -92,6 +73,16 @@ def _records_from_value(record: ConsumerRecord) -> list[ConsumerRecord | SimpleN
             )
         )
     return out if out else [record]
+
+
+def _record_with_effective_topic(record: ConsumerRecord, effective_topic: str) -> SimpleNamespace:
+    """Виртуальный record с topic=effective_topic, чтобы users/reg_company роутили по event_type при едином топике Kafka."""
+    return SimpleNamespace(
+        value=record.value,
+        topic=effective_topic,
+        partition=record.partition,
+        offset=record.offset,
+    )
 
 
 async def _dispatch_record(
@@ -112,15 +103,16 @@ async def _dispatch_record(
         settings.KAFKA_UPDATE_TOPIC,
         settings.KAFKA_UPDATE_DEPARTMENTS_TOPIC,
     ):
-        await users_handle(record, user_service, producer, settings)
+        # users_handle роутит по record.topic — передаём виртуальный record с effective topic
+        await users_handle(_record_with_effective_topic(record, topic), user_service, producer, settings)
         return
-    if topic == settings.KAFKA_INIT_COMPANY_TOPIC:
+    if topic in (settings.KAFKA_INIT_COMPANY_TOPIC, settings.KAFKA_SYNC_DEPARTMENTS_TOPIC):
         await init_company_handle(
             record, resolver, catalog_client, http_client, producer, settings
         )
         return
     if topic in (settings.KAFKA_ENABLE_REG_COMPANY_TOPIC, settings.KAFKA_DISABLE_REG_COMPANY_TOPIC):
-        reg_company_process_one(record, settings)
+        reg_company_process_one(_record_with_effective_topic(record, topic), settings)
         return
     logger.warning("unified worker: неизвестный топик topic=%s offset=%s", topic, record.offset)
 

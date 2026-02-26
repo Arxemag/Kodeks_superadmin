@@ -36,6 +36,25 @@ def unwrap_payload(value: Any) -> Any:
     return value
 
 
+def event_type_from_message(value: Any) -> str | None:
+    """Извлекает event_type из сообщения Kafka: верхний уровень или внутри payload."""
+    if not isinstance(value, dict):
+        return None
+    if "event_type" in value:
+        return str(value["event_type"])
+    if "payload" not in value:
+        return None
+    payload = value["payload"]
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except (TypeError, ValueError):
+            return None
+    if isinstance(payload, dict) and "event_type" in payload:
+        return str(payload["event_type"])
+    return None
+
+
 def create_consumer(
     *topics: str,
     group_id: str,

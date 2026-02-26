@@ -26,7 +26,7 @@ from common.config import get_settings
 from common.exceptions import AuthError, NetworkError, ParseError
 from common.kafka import create_consumer, create_producer, unwrap_payload
 from common.logger import get_logger, set_trace_id
-from services.infoboards_service.dto import InitCompanyDTO
+from services.infoboards_service.dto import InitCompanyDTO, is_missing_department_id_error
 from services.infoboards_service.init_company_service import InitCompanyService
 from services.infoboards_service.metrics import (
     init_company_active_jobs,
@@ -98,6 +98,7 @@ async def run_worker() -> None:
 
     consumer = create_consumer(
         settings.KAFKA_INIT_COMPANY_TOPIC,
+        settings.KAFKA_SYNC_DEPARTMENTS_TOPIC,
         group_id=settings.KAFKA_INIT_COMPANY_GROUP_ID,
         settings=settings,
         max_poll_records=min(50, settings.KAFKA_MAX_BATCH),
@@ -234,6 +235,8 @@ async def _handle_with_retries(
         try:
             dto = InitCompanyDTO.model_validate(payload)
         except ValidationError as e:
+            if is_missing_department_id_error(e):
+                logger.warning("В отделе отсутствует id (departments[].id). Укажите UUID для каждого отдела.")
             await _send_dlq(
                 producer, settings.KAFKA_INIT_COMPANY_DLQ_TOPIC,
                 payload, "VALIDATION_ERROR", str(e),

@@ -75,10 +75,14 @@ class Settings(BaseSettings):
     USERS_RETRY_MAX_DELAY: float = Field(3.0, description="Retry max delay in seconds")
     USERS_METRICS_PORT: int = Field(9101, description="Prometheus metrics port for users worker")
 
-    # --- INFOBOARDS init_company Kafka worker ---
+    # --- INFOBOARDS init_company / sync_departments Kafka worker ---
     KAFKA_INIT_COMPANY_TOPIC: str = Field(
         "init_company",
         description="Kafka topic for company initialization (departments, groups, ACL)",
+    )
+    KAFKA_SYNC_DEPARTMENTS_TOPIC: str = Field(
+        "sync_departments",
+        description="Kafka topic: обновление отделов и кабинетов у компании (тот же обработчик, что init_company)",
     )
     KAFKA_INIT_COMPANY_DLQ_TOPIC: str = Field(
         "init_company-dlq",

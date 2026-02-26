@@ -7,7 +7,8 @@ sync groups -> get boards -> build ACL -> GET /admin/dir?n=X (users) -> POST /ad
 """
 from __future__ import annotations
 
-import re
+import asyncio
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -25,6 +26,8 @@ from services.infoboards_service.admin_dirs import (
     parse_full_form_from_html,
 )
 from services.infoboards_service.cabinet_acl import (
+    apply_acl_via_browser,
+    fetch_acl_form_via_http,
     get_boards,
     get_docs_n_from_dirs,
 )
@@ -63,7 +66,17 @@ class InitCompanyService:
         При ошибке — исключение (worker отправит в DLQ или retry).
         """
         reg = dto.reg
+        logger.debug(
+            "handle(reg=%r, id=%r, companyName=%r, departments_count=%s, dry_run=%s)",
+            reg, dto.id, dto.companyName, len(dto.departments), dry_run,
+        )
+        if dto.departments:
+            logger.debug(
+                "handle departments: %s",
+                [(str(d.id), d.title, d.modules) for d in dto.departments],
+            )
         base_url = await self._get_base_url(reg)
+        logger.debug("_get_base_url(reg=%r) -> base_url=%r", reg, base_url)
 
         # Шаг 3: синхронизация таблицы маппинга
         await self._sync_mapping_table(reg, dto)
@@ -77,17 +90,22 @@ class InitCompanyService:
 
         # Шаг 4: синхронизация групп в сервисе
         groups_dict = await self._sync_groups(base_url, cookies, reg)
+        logger.debug("_sync_groups -> groups_count=%s keys_sample=%s", len(groups_dict), list(groups_dict.keys())[:15])
 
         # Шаг 5.1: получение кабинетов
         boards_dict = await self._get_boards(base_url, cookies)
+        logger.debug("_get_boards -> boards_count=%s mapping=%s", len(boards_dict), list(boards_dict.items())[:20])
 
         # Шаг 5.2: формирование ACL-матрицы
         dep_id_to_modules = {str(d.id): d.modules for d in dto.departments}
+        logger.debug("_build_acl_async input: reg=%r dep_id_to_modules=%s", reg, dep_id_to_modules)
         acl_matrix = await self._build_acl_async(
             reg, groups_dict, boards_dict, dep_id_to_modules
         )
+        logger.debug("_build_acl_async -> acl_matrix=%s", acl_matrix)
 
         # Шаг 6: POST /admin/dirs
+        logger.debug("_apply_acl input: base_url=%r acl_matrix=%s boards_dict_keys=%s", base_url, acl_matrix, list(boards_dict.keys()))
         await self._apply_acl(base_url, cookies, acl_matrix, boards_dict)
 
     async def _get_base_url(self, reg: str) -> str:
@@ -103,11 +121,22 @@ class InitCompanyService:
         return str(value).rstrip("/")
 
     async def _sync_mapping_table(self, reg: str, dto: InitCompanyDTO) -> None:
-        """3.1–3.3: select, insert/update, archive."""
+        """
+        3.1–3.3: select, insert/update, archive.
+        Заполнение department_service_mapping:
+          id — BIGSERIAL (авто)
+          department_id — из departments[].id (UUID)
+          service_group_name — из departments[].title (название группы в каталоге)
+          reg — из dto.reg
+          client_id — из dto.id (ID компании/клиента)
+          client_name — из dto.companyName
+          mapping_status — 'active' при insert/update, 'archived' для отделов, убранных из payload
+        """
         tbl = self.settings.DB_TABLE_DEPARTMENT_MAPPING
         client_id = str(dto.id)
         company_name = dto.companyName
         incoming_ids = {str(d.id) for d in dto.departments}
+        logger.debug("_sync_mapping_table(reg=%r, client_id=%r, company_name=%r, incoming_ids=%s)", reg, client_id, company_name, incoming_ids)
 
         # 3.1 Существующие записи
         res = await self.db.execute(
@@ -119,6 +148,7 @@ class InitCompanyService:
         )
         rows = list(res)
         existing = {r[1]: MappingRow(*r) for r in rows}
+        logger.debug("_sync_mapping_table existing count=%s dept_ids=%s", len(existing), list(existing.keys()))
 
         # 3.2 Обработка входящих departments
         for dept in dto.departments:
@@ -166,8 +196,10 @@ class InitCompanyService:
         self, base_url: str, cookies: dict[str, str], reg: str
     ) -> dict[str, int]:
         """4.1–4.2: GET groups, парсинг, создание недостающих."""
+        logger.debug("_sync_groups(base_url=%r, reg=%r)", base_url, reg)
         html = await self.catalog_client.get_groups_page(base_url, cookies)
         groups: dict[str, int] = parse_groups_catalog(html)
+        logger.debug("_sync_groups GET groups parsed count=%s", len(groups))
 
         tbl = self.settings.DB_TABLE_DEPARTMENT_MAPPING
         res = await self.db.execute(
@@ -178,6 +210,7 @@ class InitCompanyService:
             {"reg": reg},
         )
         active_names = {row[0] for row in res}
+        logger.debug("_sync_groups active_names from DB=%s", active_names)
 
         for name in active_names:
             if name not in groups:
@@ -190,6 +223,7 @@ class InitCompanyService:
 
     async def _get_boards(self, base_url: str, cookies: dict[str, str]) -> dict[str, str]:
         """5.1: GraphQL board.many -> title -> id (через cabinet_acl.get_boards)."""
+        logger.debug("_get_boards(base_url=%r)", base_url)
         try:
             return await get_boards(base_url, self.http_client, cookies)
         except NetworkError as e:
@@ -216,6 +250,10 @@ class InitCompanyService:
         dep_id_to_modules: dict[str, list[str]],
     ) -> dict[str, list[int]]:
         """5.2: board_id -> [group_ids]."""
+        logger.debug(
+            "_build_acl_async(reg=%r, groups_dict_len=%s, boards_dict_len=%s, dep_id_to_modules=%s)",
+            reg, len(groups_dict), len(boards_dict), dep_id_to_modules,
+        )
         tbl = self.settings.DB_TABLE_DEPARTMENT_MAPPING
         res = await self.db.execute(
             text(f"""
@@ -230,12 +268,15 @@ class InitCompanyService:
             dept_id, service_group_name = row[0], row[1]
             group_id = groups_dict.get(service_group_name)
             if group_id is None:
+                logger.debug("_build_acl_async skip dept_id=%s service_group_name=%r (group not in catalog)", dept_id, service_group_name)
                 continue
             modules = dep_id_to_modules.get(dept_id, [])
             for mod_title in modules:
                 board_id = boards_dict.get(mod_title)
                 if board_id:
                     acl.setdefault(board_id, []).append(group_id)
+                else:
+                    logger.debug("_build_acl_async skip mod_title=%r (board not in boards_dict)", mod_title)
         for key in acl:
             acl[key] = list(dict.fromkeys(acl[key]))  # уникальные id с сохранением порядка
         return acl
@@ -247,128 +288,142 @@ class InitCompanyService:
         acl_matrix: dict[str, list[int]],
         boards_dict: dict[str, str],
     ) -> None:
-        """6: GET /admin/dirs → найти n для /users/ → GET /admin/dir?n=X → merge → POST."""
-        dirs_url = f"{base_url}/admin/dirs"
-        try:
-            resp = await self.http_client.get(dirs_url, cookies=cookies)
-        except (httpx.TimeoutException, httpx.NetworkError) as e:
-            raise NetworkError(code="ADMIN_DIRS_FAILED", message="GET /admin/dirs failed") from e
-        if resp.status_code in (401, 403):
-            raise AuthError(
-                code="CATALOG_AUTH_FAILED",
-                message="Admin cookies not accepted for /admin/dirs",
-                http_status=401,
-            )
-        if resp.status_code >= 400:
-            raise NetworkError(
-                code="ADMIN_DIRS_4XX",
-                message=f"GET /admin/dirs status={resp.status_code}",
-                http_status=502,
-            )
-        dirs_html = resp.text or ""
-        docs_n = get_docs_n_from_dirs(dirs_html)
-        dir_url = f"{base_url}/admin/dir?n={docs_n}"
-        try:
-            resp = await self.http_client.get(dir_url, cookies=cookies)
-        except (httpx.TimeoutException, httpx.NetworkError) as e:
-            raise NetworkError(code="ADMIN_DIRS_FAILED", message="GET /admin/dir failed") from e
-        if resp.status_code in (401, 403):
-            raise AuthError(
-                code="CATALOG_AUTH_FAILED",
-                message="Admin cookies not accepted for /admin/dir",
-                http_status=401,
-            )
-        if resp.status_code >= 400:
-            raise NetworkError(
-                code="ADMIN_DIRS_4XX",
-                message=f"GET {dir_url} status={resp.status_code}",
-                http_status=502,
-            )
-        page_html = resp.text or ""
-        setup_form = parse_full_form_from_html(page_html)
-        if not setup_form:
-            setup_form = {"n": docs_n, "set": ""}
-        setup_form["setup2"] = "Настройки сервисов"
-        setup_form.setdefault("n", docs_n)
-        from urllib.parse import urlencode as _urlencode
-        encoded_setup = _urlencode([(k, str(v)) for k, v in setup_form.items()])
-        try:
-            resp = await self.http_client.post(
-                f"{base_url}/admin/dir",
-                content=encoded_setup,
-                cookies=cookies,
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-            )
-        except (httpx.TimeoutException, httpx.NetworkError) as e:
-            raise NetworkError(code="ADMIN_DIRS_FAILED", message="POST setup2 failed") from e
-        if resp.status_code >= 400:
-            raise NetworkError(
-                code="ADMIN_DIRS_4XX",
-                message=f"POST setup2 status={resp.status_code}",
-                http_status=502,
-            )
-        setup_html = resp.text or ""
-        has_acl = "acl_infoboard_" in setup_html or bool(parse_acl_from_html(setup_html))
-        post_url = f"{base_url}/admin/dirs"
-        acl_form_base = ""
-        if not has_acl:
-            for try_url in [
-                f"{base_url}/admin/dirs?base=%2Fdocs",
-                f"{base_url}/admin/dirs?base=%2Fusers",
-                f"{base_url}/admin/dirs",
-            ]:
-                try:
-                    r = await self.http_client.get(try_url, cookies=cookies)
-                except (httpx.TimeoutException, httpx.NetworkError):
-                    continue
-                if r.status_code == 200:
-                    ch = r.text or ""
-                    if "acl_infoboard_" in ch or parse_acl_from_html(ch):
-                        setup_html = ch
-                        has_acl = True
-                        post_url = f"{base_url}/admin/dirs"
-                        m = re.search(r"base=([^&'\"]+)", try_url, re.I)
-                        if m:
-                            acl_form_base = m.group(1)
-                        break
-        else:
-            post_url = f"{base_url}/admin/dirs"
-            acl_form_base = "/docs"
+        """6: Та же логика, что add_cabinet_group — форма через fetch_acl_form_via_http, затем POST /admin/dirs."""
+        from urllib.parse import unquote, urlencode
+
+        logger.debug("_apply_acl calling fetch_acl_form_via_http(base_url=%r)", base_url)
+        setup_html, post_url, acl_form_base, _docs_n = await fetch_acl_form_via_http(
+            base_url, self.http_client, cookies
+        )
+        logger.debug("_apply_acl fetch_acl_form_via_http -> setup_html_len=%s post_url=%r acl_form_base=%r docs_n=%s", len(setup_html), post_url, acl_form_base, _docs_n)
+        # Если форма рендерится через JS, в HTML нет acl_infoboard_* — применяем ACL в той же браузерной сессии и выходим.
+        acl_from_html = parse_acl_from_html(setup_html)
+        if not acl_from_html and acl_matrix:
+            try:
+                await apply_acl_via_browser(base_url, cookies, _docs_n, acl_matrix)
+                return
+            except NetworkError as e:
+                if getattr(e, "code", None) == "PLAYWRIGHT_NOT_INSTALLED":
+                    logger.warning("Playwright не установлен, форма без acl_infoboard_*: %s", e.message)
+                else:
+                    raise
         full_form = parse_full_form_from_html(setup_html)
-        if acl_form_base and "base" not in full_form:
-            full_form["base"] = acl_form_base
+        logger.debug("_apply_acl parse_full_form_from_html -> full_form_keys_count=%s keys=%s", len(full_form), sorted(full_form.keys()))
+        # Не добавляем base/path/action: в примере параметров POST /admin/dirs их нет, каталог может 500 на лишних полях.
         if not full_form:
             acl_by_key = parse_acl_from_html(setup_html)
             full_form = {f"acl_infoboard_{k}": v for k, v in acl_by_key.items()}
+            logger.debug("_apply_acl full_form was empty, filled from parse_acl_from_html -> keys=%s", sorted(full_form.keys()))
+        # Ключи кабинетов: из full_form или из parse_acl_from_html (если форма парсится иначе).
+        form_board_keys = set()
+        for k in full_form:
+            if k.startswith("acl_infoboard_"):
+                base = k.rsplit("_view", 1)[0] if k.endswith("_view") else k
+                base = base.replace("acl_infoboard_", "").lower()
+                if base and not base.endswith("_view"):
+                    form_board_keys.add(base)
+        if not form_board_keys:
+            acl_by_key = parse_acl_from_html(setup_html)
+            form_board_keys = set(acl_by_key.keys())
+            logger.debug("_apply_acl form_board_keys was empty, fallback parse_acl_from_html -> form_board_keys=%s", sorted(form_board_keys))
+            for bk, acl_val in acl_by_key.items():
+                full_form.setdefault(f"acl_infoboard_{bk}", acl_val)
+                full_form.setdefault(f"acl_infoboard_{bk}_view", acl_val)
+        else:
+            logger.debug("_apply_acl form_board_keys from full_form=%s", sorted(form_board_keys))
+
+        acl_overrides_safe = {
+            k: v for k, v in acl_matrix.items()
+            if k.lower() in form_board_keys
+        }
+        # Если каталог вернул форму без acl_infoboard_* (форма рендерится через JS), собираем минимальную форму только по нашим кабинетам.
+        if acl_matrix and not form_board_keys:
+            logger.info(
+                "Форма каталога без полей acl_infoboard_* (вероятно JS). Используем минимальную форму только для кабинетов acl_matrix=%s",
+                list(acl_matrix.keys()),
+            )
+            for bk in acl_matrix:
+                bkl = bk.lower()
+                form_board_keys.add(bkl)
+                full_form.setdefault(f"acl_infoboard_{bkl}", "")
+                full_form.setdefault(f"acl_infoboard_{bkl}_view", "")
+            acl_overrides_safe = {k: v for k, v in acl_matrix.items()}
+        elif acl_matrix and not acl_overrides_safe:
+            logger.warning(
+                "acl_matrix кабинеты %s не найдены в форме каталога (доступны: %s), ACL не применён",
+                list(acl_matrix.keys()), sorted(form_board_keys)[:20],
+            )
+
+        logger.debug("_apply_acl acl_overrides_safe=%s (acl_matrix keys=%s form_board_keys=%s)", acl_overrides_safe, list(acl_matrix.keys()), sorted(form_board_keys))
         form_data = build_admin_dirs_form(
             full_form,
-            acl_overrides=acl_matrix,
-            extra_board_ids={bid for bid in boards_dict.values()},
+            acl_overrides=acl_overrides_safe,
+            extra_board_ids=None,
         )
-        from urllib.parse import urlencode
+        # Не фильтровать пустые поля: отсутствие поля сервер может трактовать как сброс.
         encoded = urlencode(form_data)
-        logger.debug(f"POST {post_url} fields_count={len(form_data)}")
-        try:
-            resp = await self.http_client.post(
-                post_url,
-                content=encoded,
-                cookies=cookies,
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-            )
-        except (httpx.TimeoutException, httpx.NetworkError) as e:
-            raise NetworkError(code="ADMIN_DIRS_FAILED", message="POST /admin/dirs failed") from e
+        logger.debug(
+            "POST %s fields_count=%s form_keys=%s",
+            post_url, len(form_data), [k for k, _ in form_data],
+        )
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        if base_url:
+            headers["Referer"] = f"{base_url}/admin/dir"
+            headers["Origin"] = base_url.rstrip("/")
+        attempts = getattr(self.settings, "USERS_RETRY_ATTEMPTS", 3)
+        base_delay = getattr(self.settings, "USERS_RETRY_BASE_DELAY", 0.2)
+        max_delay = getattr(self.settings, "USERS_RETRY_MAX_DELAY", 3.0)
+        for attempt in range(1, attempts + 1):
+            try:
+                resp = await self.http_client.post(
+                    post_url,
+                    content=encoded,
+                    cookies=cookies,
+                    headers=headers,
+                )
+            except (httpx.TimeoutException, httpx.NetworkError) as e:
+                raise NetworkError(code="ADMIN_DIRS_FAILED", message="POST /admin/dirs failed") from e
 
-        if resp.status_code in (401, 403):
-            raise AuthError(
-                code="CATALOG_AUTH_FAILED",
-                message="Admin cookies not accepted for /admin/dirs",
-                http_status=401,
-            )
-        if resp.status_code >= 500:
-            raise NetworkError(code="ADMIN_DIRS_5XX", message="admin/dirs 5xx")
-        if resp.status_code >= 400:
-            raise NetworkError(
-                code="ADMIN_DIRS_4XX",
-                message=f"admin/dirs status={resp.status_code}",
-                http_status=502,
-            )
+            if resp.status_code in (401, 403):
+                raise AuthError(
+                    code="CATALOG_AUTH_FAILED",
+                    message="Admin cookies not accepted for /admin/dirs",
+                    http_status=401,
+                )
+            if resp.status_code >= 500:
+                if attempt < attempts:
+                    delay = min(max_delay, base_delay * (2 ** (attempt - 1)))
+                    logger.warning(
+                        "admin/dirs 5xx status=%s attempt=%s/%s retry in %.2fs",
+                        resp.status_code, attempt, attempts, delay,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                body_snippet = (resp.text or "")[:500]
+                req_len = len(encoded)
+                logger.error(
+                    "admin/dirs 5xx status=%s request_body_len=%s body_snippet=%s",
+                    resp.status_code,
+                    req_len,
+                    body_snippet.replace("\n", " ").strip(),
+                )
+                dump_path = os.environ.get("DUMP_ADMIN_DIRS_ON_5XX")
+                if dump_path:
+                    try:
+                        path = os.path.join(dump_path, "admin_dirs_5xx_request.txt")
+                        with open(path, "w", encoding="utf-8") as f:
+                            f.write(encoded)
+                        logger.error("admin/dirs request body saved to %s", path)
+                    except OSError as e:
+                        logger.warning("could not dump admin_dirs request: %s", e)
+                raise NetworkError(
+                    code="ADMIN_DIRS_5XX",
+                    message=f"admin/dirs 5xx status={resp.status_code} (request_body_len={req_len})",
+                )
+            if resp.status_code >= 400:
+                raise NetworkError(
+                    code="ADMIN_DIRS_4XX",
+                    message=f"admin/dirs status={resp.status_code}",
+                    http_status=502,
+                )
+            break

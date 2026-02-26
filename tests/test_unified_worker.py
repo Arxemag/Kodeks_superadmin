@@ -8,7 +8,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from services.unified_worker import _all_topics, _dispatch_record, _effective_topic, _event_type_from_value, _records_from_value
+from common.kafka import event_type_from_message
+from services.unified_worker import _all_topics, _dispatch_record, _effective_topic, _records_from_value
 from services.users_service.dto import CreateUserDTO
 from services.users_service.service import UserService
 from tests.conftest import StubAuthClient, StubCatalogClient, StubRegResolver
@@ -26,6 +27,7 @@ def unified_settings() -> MagicMock:
     s.KAFKA_UPDATE_TOPIC = "update-user"
     s.KAFKA_UPDATE_DEPARTMENTS_TOPIC = "update-user-departments"
     s.KAFKA_INIT_COMPANY_TOPIC = "init_company"
+    s.KAFKA_SYNC_DEPARTMENTS_TOPIC = "sync_departments"
     s.KAFKA_ENABLE_REG_COMPANY_TOPIC = "enable_reg_company"
     s.KAFKA_DISABLE_REG_COMPANY_TOPIC = "disable_reg_company"
     s.KAFKA_DLQ_TOPIC = "users-dlq"
@@ -36,16 +38,17 @@ def unified_settings() -> MagicMock:
     return s
 
 
-def test_all_topics_returns_six_topics(unified_settings: MagicMock) -> None:
-    """_all_topics возвращает ровно 6 топиков в нужном порядке."""
+def test_all_topics_returns_seven_topics(unified_settings: MagicMock) -> None:
+    """_all_topics возвращает 7 топиков в нужном порядке (включая sync_departments)."""
     topics = _all_topics(unified_settings)
-    assert len(topics) == 6
+    assert len(topics) == 7
     assert topics[0] == "create-user"
     assert topics[1] == "update-user"
     assert topics[2] == "update-user-departments"
     assert topics[3] == "init_company"
-    assert topics[4] == "enable_reg_company"
-    assert topics[5] == "disable_reg_company"
+    assert topics[4] == "sync_departments"
+    assert topics[5] == "enable_reg_company"
+    assert topics[6] == "disable_reg_company"
 
 
 def test_effective_topic_from_record_topic() -> None:
@@ -67,7 +70,7 @@ def test_effective_topic_from_event_type_inside_payload() -> None:
         {"event_id": "e1", "payload": {"event_type": "init_company", "reg": "123", "companyName": "OOO"}},
     )
     assert _effective_topic(record) == "init_company"
-    assert _event_type_from_value(record.value) == "init_company"
+    assert event_type_from_message(record.value) == "init_company"
 
 
 def test_records_from_value_single() -> None:
@@ -214,6 +217,28 @@ async def test_dispatch_record_init_company_calls_init_company_handle(unified_se
         assert args[1] is resolver
         assert args[4] is producer
         assert args[5] is unified_settings
+
+
+@pytest.mark.asyncio
+async def test_dispatch_record_sync_departments_calls_init_company_handle(unified_settings: MagicMock) -> None:
+    """Топик sync_departments — тот же обработчик, что init_company."""
+    record = _fake_record("sync_departments", {"id": 1, "reg": "123", "departments": []})
+    with patch("services.unified_worker.init_company_handle", new_callable=AsyncMock) as mock_init:
+        await _dispatch_record(
+            record,
+            user_service=UserService(
+                auth_client=StubAuthClient(),
+                catalog_client=StubCatalogClient(),
+                reg_resolver=StubRegResolver(),
+            ),
+            resolver=StubRegResolver(),
+            catalog_client=MagicMock(),
+            http_client=MagicMock(),
+            producer=AsyncMock(),
+            settings=unified_settings,
+        )
+        mock_init.assert_called_once()
+        assert mock_init.call_args[0][0].topic == "sync_departments"
 
 
 @pytest.mark.asyncio

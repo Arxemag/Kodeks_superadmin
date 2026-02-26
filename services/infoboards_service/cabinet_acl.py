@@ -2,21 +2,23 @@
 Общая логика «добавить группу в кабинет» (ACL): кабинеты, форма, POST.
 
 Используется: scripts/add_cabinet_group.py (CLI), InitCompanyService (get_boards).
-Константы и HTTP-путь получения формы — единый источник правды; скрипт добавляет
-опциональный путь через Playwright (см. add_cabinet_group.py).
+Константы и HTTP-путь получения формы — единый источник правды.
+При JS-рендеринге формы используется fetch_acl_form_via_browser (Playwright).
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
-from urllib.parse import unquote, urlencode
+from urllib.parse import unquote, urlparse, urlencode
 
 import httpx
 
 from common.exceptions import NetworkError
 from common.logger import get_logger
 from services.infoboards_service.admin_dirs import (
+    acl_to_json,
     add_group_to_acl_json,
     build_admin_dirs_form,
     parse_acl_from_html,
@@ -108,6 +110,7 @@ async def fetch_acl_form_via_http(
     Возвращает (html, post_url, acl_form_base, docs_n).
     """
     dirs_url = f"{base_url}/admin/dirs"
+    logger.debug("fetch_acl_form_via_http GET %s", dirs_url)
     resp = await client.get(dirs_url, cookies=cookies)
     if resp.status_code >= 400:
         raise NetworkError(
@@ -117,7 +120,9 @@ async def fetch_acl_form_via_http(
     dirs_html = resp.text or ""
     if docs_n is None:
         docs_n = get_docs_n_from_dirs(dirs_html)
+    logger.debug("fetch_acl_form_via_http docs_n=%s", docs_n)
     dir_url = f"{base_url}/admin/dir?n={docs_n}"
+    logger.debug("fetch_acl_form_via_http GET %s", dir_url)
     resp = await client.get(dir_url, cookies=cookies)
     if resp.status_code >= 400:
         raise NetworkError(
@@ -134,6 +139,7 @@ async def fetch_acl_form_via_http(
     setup_form.setdefault("n", docs_n)
     setup_form.setdefault("action", "save")
     encoded_setup = urlencode([(k, str(v)) for k, v in setup_form.items()])
+    logger.debug("fetch_acl_form_via_http POST %s/admin/dir setup_form_keys=%s", base_url, list(setup_form.keys()))
     resp = await client.post(
         f"{base_url}/admin/dir",
         content=encoded_setup,
@@ -146,7 +152,12 @@ async def fetch_acl_form_via_http(
             message=f"POST setup2 status={resp.status_code}",
         )
     setup_html = resp.text or ""
-    has_acl = "acl_infoboard_" in setup_html or bool(parse_acl_from_html(setup_html))
+    acl_parsed = parse_acl_from_html(setup_html)
+    has_acl = "acl_infoboard_" in setup_html or bool(acl_parsed)
+    logger.debug(
+        "fetch_acl_form_via_http POST response setup_html_len=%s has_acl=%s parse_acl_from_html_keys=%s",
+        len(setup_html), has_acl, list(acl_parsed.keys()) if acl_parsed else [],
+    )
     post_url = f"{base_url}/admin/dirs"
     acl_form_base = "%2Fdocs"
     if not has_acl:
@@ -171,6 +182,170 @@ async def fetch_acl_form_via_http(
     else:
         acl_form_base = "%2Fdocs"
     return (setup_html, post_url, acl_form_base, docs_n)
+
+
+def _pw_cookies(cookies: dict[str, str], base_url: str) -> list[dict]:
+    """Кукки в формате Playwright (name, value, domain, path)."""
+    parsed = urlparse(base_url)
+    domain = parsed.netloc or parsed.path.split("/")[0] or "localhost"
+    return [{"name": k, "value": v, "domain": domain, "path": "/"} for k, v in cookies.items()]
+
+
+async def fetch_acl_form_via_browser(
+    base_url: str,
+    cookies: dict[str, str],
+    docs_n: str,
+) -> tuple[str, str, str, str]:
+    """
+    Получить HTML формы ACL через Playwright (JS выполняется, форма acl_infoboard_* появляется в DOM).
+    Возвращает (html, post_url, acl_form_base, docs_n). Требует: pip install playwright && playwright install chromium.
+    """
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError as e:
+        raise NetworkError(
+            code="PLAYWRIGHT_NOT_INSTALLED",
+            message="Для загрузки формы с JS установите: pip install playwright && playwright install chromium",
+        ) from e
+
+    url = f"{base_url}/admin/dir?n={docs_n}"
+    logger.info("fetch_acl_form_via_browser: загрузка формы ACL через браузер (Playwright) %s", url)
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        try:
+            context = await browser.new_context()
+            await context.add_cookies(_pw_cookies(cookies, base_url))
+            page = await context.new_page()
+            await page.goto(url, wait_until="networkidle", timeout=30000)
+            await page.wait_for_selector("form, a", timeout=10000)
+            submitted = False
+            btn = page.locator('input[name=setup2][type=submit], input[name=setup2][value*="Настройки"]')
+            if await btn.count() > 0:
+                await btn.first.click()
+                submitted = True
+            if not submitted:
+                sel = page.locator("select[name=setup2]")
+                if await sel.count() > 0:
+                    await sel.select_option(label="Настройки сервисов")
+                    await page.locator('input[type="submit"], button[type="submit"]').first.click()
+                    submitted = True
+            if not submitted:
+                link = page.get_by_text("Настройки сервисов", exact=False).first
+                if await link.count() > 0:
+                    await link.click()
+                    submitted = True
+            if not submitted:
+                raise ValueError("Не найдена кнопка/ссылка «Настройки сервисов»")
+            await asyncio.sleep(0.5)
+            await page.wait_for_load_state("networkidle", timeout=15000)
+            try:
+                await page.wait_for_selector('input[name^="acl_infoboard_"], div.acl', timeout=15000)
+            except Exception:
+                await asyncio.sleep(2)
+            await asyncio.sleep(1)
+            html = await page.content()
+        finally:
+            await browser.close()
+
+    post_url = f"{base_url}/admin/dirs"
+    acl_form_base = "%2Fdocs"
+    acl_keys = list(parse_acl_from_html(html).keys())
+    logger.debug("fetch_acl_form_via_browser -> html_len=%s parse_acl_keys=%s", len(html), acl_keys[:20] if acl_keys else [])
+    return (html, post_url, acl_form_base, docs_n)
+
+
+async def apply_acl_via_browser(
+    base_url: str,
+    cookies: dict[str, str],
+    docs_n: str,
+    acl_matrix: dict[str, list[int]],
+) -> None:
+    """
+    Открыть форму «Настройки сервисов» в браузере, подставить ACL из acl_matrix
+    (board_key -> list[group_id]), отправить форму из той же сессии. Устраняет 500 при POST через httpx.
+    """
+    if not acl_matrix:
+        return
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError as e:
+        raise NetworkError(
+            code="PLAYWRIGHT_NOT_INSTALLED",
+            message="Для применения ACL через браузер: pip install playwright && playwright install chromium",
+        ) from e
+
+    url = f"{base_url}/admin/dir?n={docs_n}"
+    logger.info("apply_acl_via_browser: применение ACL в браузере (POST из сессии) %s", url)
+    set_val_js = "(el, val) => { if (el) el.value = val; }"
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        try:
+            context = await browser.new_context()
+            await context.add_cookies(_pw_cookies(cookies, base_url))
+            page = await context.new_page()
+            await page.goto(url, wait_until="networkidle", timeout=30000)
+            await page.wait_for_selector("form, a", timeout=10000)
+            btn = page.locator('input[name=setup2][type=submit], input[name=setup2][value*="Настройки"]')
+            if await btn.count() > 0:
+                await btn.first.click()
+            else:
+                sel = page.locator("select[name=setup2]")
+                if await sel.count() > 0:
+                    await sel.select_option(label="Настройки сервисов")
+                    await page.locator('input[type="submit"], button[type="submit"]').first.click()
+                else:
+                    link = page.get_by_text("Настройки сервисов", exact=False).first
+                    if await link.count() > 0:
+                        await link.click()
+            await page.wait_for_load_state("networkidle", timeout=15000)
+            await page.wait_for_selector('input[name^="acl_infoboard_"]', state="attached", timeout=15000)
+            await asyncio.sleep(0.3)
+            for board_key, group_ids in acl_matrix.items():
+                key_lower = board_key.lower()
+                acl_val = acl_to_json(group_ids)
+                for name in (f"acl_infoboard_{key_lower}", f"acl_infoboard_{key_lower}_view"):
+                    inp = page.locator(f'input[name="{name}"]')
+                    if await inp.count() > 0:
+                        await inp.evaluate(set_val_js, acl_val)
+                for name in (f"infoboard_{key_lower}", f"infoboard_{key_lower}_view"):
+                    chk = page.locator(f'input[name="{name}"]')
+                    if await chk.count() > 0:
+                        try:
+                            await chk.check()
+                        except Exception:
+                            pass
+            await asyncio.sleep(0.2)
+            save_btn = page.locator(
+                'input[type="submit"][value*="Сохранить"], input[type="submit"][value*="Save"], '
+                'button[type="submit"], form[action*="admin/dirs"] input[type="submit"]'
+            ).first
+            try:
+                await save_btn.wait_for(state="visible", timeout=10000)
+                await save_btn.click(timeout=15000)
+            except Exception as click_err:
+                alt_btn = page.get_by_role("button", name="Сохранить").or_(
+                    page.get_by_role("button", name="Save")
+                ).first
+                if await alt_btn.count() > 0:
+                    await alt_btn.click(timeout=15000)
+                else:
+                    submitted = await page.evaluate(
+                        """() => {
+                            const form = document.querySelector('form[action*="admin/dirs"]') || document.querySelector('form');
+                            if (form) { form.requestSubmit(); return true; }
+                            return false;
+                        }"""
+                    )
+                    if not submitted:
+                        raise NetworkError(
+                            code="ACL_SAVE_FAILED",
+                            message=f"Не удалось отправить форму: {click_err!r}",
+                        ) from click_err
+            await page.wait_for_load_state("networkidle", timeout=15000)
+            await asyncio.sleep(0.5)
+            logger.debug("apply_acl_via_browser: форма отправлена успешно")
+        finally:
+            await browser.close()
 
 
 def build_acl_form_data(
