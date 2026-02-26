@@ -1,7 +1,7 @@
 """
 DTO для Kafka init_company.
 
-Формат входящего сообщения:
+Все поля обязательны. Формат входящего сообщения:
 {
   "id": 67,
   "reg": "123456",
@@ -30,7 +30,7 @@ class DepartmentPayload(BaseModel):
 
 
 class InitCompanyDTO(BaseModel):
-    """DTO входящего сообщения init_company."""
+    """DTO входящего сообщения init_company. Все поля обязательны."""
     id: int
     reg: str
     companyName: str

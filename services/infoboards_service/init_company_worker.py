@@ -214,8 +214,20 @@ async def _handle_with_retries(
         init_company_failed_total.labels(reason="invalid_payload").inc()
         return
 
+    # Поддержка обёртки payload.data (если reg/id/companyName не на верхнем уровне)
+    if "data" in payload and isinstance(payload.get("data"), dict) and payload.get("reg") is None:
+        payload = payload["data"]
+
+    # Подстановка reg из типичных альтернативных ключей, если пришло под другим именем
+    if payload.get("reg") is None:
+        for key in ("registration", "reg_number", "regNumber", "companyReg"):
+            if payload.get(key) is not None:
+                payload = {**payload, "reg": str(payload[key])}
+                break
+
     set_trace_id(f"init_company-{record.topic}-{record.partition}-{record.offset}")
     logger.info(f"processing init_company offset={record.offset} reg={payload.get('reg')!r}")
+    logger.debug("init_company payload keys: %s", list(payload.keys()))
 
     attempts = settings.USERS_RETRY_ATTEMPTS
     for attempt in range(1, attempts + 1):
