@@ -17,6 +17,7 @@ import httpx
 
 from common.exceptions import NetworkError
 from common.logger import get_logger
+from common.playwright_browser import open_chromium
 from services.infoboards_service.admin_dirs import (
     acl_to_json,
     add_group_to_acl_json,
@@ -205,14 +206,13 @@ async def fetch_acl_form_via_browser(
     except ImportError as e:
         raise NetworkError(
             code="PLAYWRIGHT_NOT_INSTALLED",
-            message="Для загрузки формы с JS установите: pip install playwright && playwright install chromium",
+            message="Для загрузки формы с JS установите: pip install playwright",
         ) from e
 
     url = f"{base_url}/admin/dir?n={docs_n}"
     logger.info("fetch_acl_form_via_browser: загрузка формы ACL через браузер (Playwright) %s", url)
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        try:
+        async with open_chromium(p, logger=logger) as browser:
             context = await browser.new_context()
             await context.add_cookies(_pw_cookies(cookies, base_url))
             page = await context.new_page()
@@ -244,8 +244,6 @@ async def fetch_acl_form_via_browser(
                 await asyncio.sleep(2)
             await asyncio.sleep(1)
             html = await page.content()
-        finally:
-            await browser.close()
 
     post_url = f"{base_url}/admin/dirs"
     acl_form_base = "%2Fdocs"
@@ -271,15 +269,14 @@ async def apply_acl_via_browser(
     except ImportError as e:
         raise NetworkError(
             code="PLAYWRIGHT_NOT_INSTALLED",
-            message="Для применения ACL через браузер: pip install playwright && playwright install chromium",
+            message="Для применения ACL через браузер установите: pip install playwright",
         ) from e
 
     url = f"{base_url}/admin/dir?n={docs_n}"
     logger.info("apply_acl_via_browser: применение ACL в браузере (POST из сессии) %s", url)
     set_val_js = "(el, val) => { if (el) el.value = val; }"
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        try:
+        async with open_chromium(p, logger=logger) as browser:
             context = await browser.new_context()
             await context.add_cookies(_pw_cookies(cookies, base_url))
             page = await context.new_page()
@@ -344,8 +341,6 @@ async def apply_acl_via_browser(
             await page.wait_for_load_state("networkidle", timeout=15000)
             await asyncio.sleep(0.5)
             logger.debug("apply_acl_via_browser: форма отправлена успешно")
-        finally:
-            await browser.close()
 
 
 def build_acl_form_data(

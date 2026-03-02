@@ -32,6 +32,7 @@ from common.config import get_settings
 from common.exceptions import AuthError, NetworkError
 from common.http import _default_headers, request_with_retry
 from common.logger import get_logger
+from common.playwright_browser import open_chromium
 from services.infoboards_service.admin_dirs import (
     acl_to_json,
     parse_acl_from_html,
@@ -128,8 +129,7 @@ async def _fetch_html_via_browser(url: str, cookies: dict[str, str], base_url: s
     from playwright.async_api import async_playwright
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        try:
+        async with open_chromium(p, logger=logger) as browser:
             context = await browser.new_context()
             await context.add_cookies(_pw_cookies(cookies, base_url))
             page = await context.new_page()
@@ -140,8 +140,6 @@ async def _fetch_html_via_browser(url: str, cookies: dict[str, str], base_url: s
                 await page.wait_for_selector("div.acl, form", timeout=5000)
             await asyncio.sleep(1)
             return await page.content()
-        finally:
-            await browser.close()
 
 
 async def _fetch_setup_response_via_browser(
@@ -155,8 +153,7 @@ async def _fetch_setup_response_via_browser(
 
     url = f"{base_url}/admin/dir?n={docs_n}"
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        try:
+        async with open_chromium(p, logger=logger) as browser:
             context = await browser.new_context()
             await context.add_cookies(_pw_cookies(cookies, base_url))
             page = await context.new_page()
@@ -189,8 +186,6 @@ async def _fetch_setup_response_via_browser(
                 await asyncio.sleep(2)
             await asyncio.sleep(1)
             return await page.content()
-        finally:
-            await browser.close()
 
 
 async def _submit_acl_via_browser(
@@ -209,8 +204,7 @@ async def _submit_acl_via_browser(
     url = f"{base_url}/admin/dir?n={docs_n}"
     acl_val = acl_to_json([group_id])
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        try:
+        async with open_chromium(p, logger=logger) as browser:
             context = await browser.new_context()
             await context.add_cookies(_pw_cookies(cookies, base_url))
             page = await context.new_page()
@@ -281,8 +275,6 @@ async def _submit_acl_via_browser(
             await page.wait_for_load_state("networkidle", timeout=15000)
             await asyncio.sleep(0.5)
             return True
-        finally:
-            await browser.close()
 
 
 async def _get_base_url(reg: str) -> str:

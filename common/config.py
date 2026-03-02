@@ -49,6 +49,10 @@ class Settings(BaseSettings):
 
     HTTP_TIMEOUT: float = Field(10.0, description="HTTP timeout seconds")
     LOG_LEVEL: str = Field("INFO", description="Log level")
+    CHROMIUM_WS_ENDPOINT: str = Field(
+        "",
+        description="Remote Chromium CDP endpoint (e.g. ws://chromium:3000 or http://chromium:3000)",
+    )
 
     # Значения берутся из ENV (PORT, AUTH_SERVICE_URL); ниже — только дефолты при отсутствии переменной
     PORT: int = Field(8000, description="HTTP server port (Auth API), env: PORT")
