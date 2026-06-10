@@ -101,6 +101,32 @@ class Settings(BaseSettings):
         description="Prometheus metrics port for init_company worker",
     )
 
+    # --- correct_cabinet: уточнение кабинета по опроснику (удаление виджетов невыбранных вариантов) ---
+    KAFKA_CORRECT_CABINET_TOPIC: str = Field(
+        "correct_cabinet",
+        description="Kafka topic: уточнение кабинета (link + questions[] с выбранными ответами)",
+    )
+    KAFKA_CABINET_CORRECTED_TOPIC: str = Field(
+        "cabinet-corrected",
+        description="Kafka topic: ответ после уточнения (userId, reg, oldLink, link)",
+    )
+    KAFKA_CORRECT_CABINET_DLQ_TOPIC: str = Field(
+        "correct_cabinet-dlq",
+        description="Kafka DLQ topic for correct_cabinet",
+    )
+    KAFKA_CORRECT_CABINET_GROUP_ID: str = Field(
+        "infoboards-correct-cabinet",
+        description="Kafka consumer group for correct_cabinet (отдельный воркер)",
+    )
+    CORRECT_CABINET_METRICS_PORT: int = Field(
+        9104,
+        description="Prometheus metrics port for correct_cabinet worker",
+    )
+    CORRECT_CABINET_DRY_RUN: bool = Field(
+        False,
+        description="Если true — correct_cabinet только логирует план (без удаления виджетов). Для безопасного первого прогона.",
+    )
+
     # --- Reg company (enable/disable) Kafka worker — пока только приём и лог ---
     KAFKA_ENABLE_REG_COMPANY_TOPIC: str = Field(
         "enable_reg_company",

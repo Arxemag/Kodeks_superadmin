@@ -19,7 +19,30 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+
+class CorrectCabinetQuestion(BaseModel):
+    """Вопрос опросника с выбранными клиентом ответами."""
+    question: str = ""
+    answers: list[str] = Field(default_factory=list)
+
+
+class CorrectCabinetDTO(BaseModel):
+    """
+    DTO топика correct_cabinet: уточнение кабинета по опроснику.
+    userId — пользователь, которому правим (эхо в ответ); reg — рег; link — ссылка на родительский кабинет;
+    questions — вопросы с выбранными ответами. 'Выбрать всё' в ответах => вопрос не трогаем.
+    """
+    userId: int | None = None
+    reg: str
+    link: str
+    questions: list[CorrectCabinetQuestion] = Field(default_factory=list)
+
+    @field_validator("reg", mode="before")
+    @classmethod
+    def _reg_to_str(cls, v: object) -> str:
+        return str(v) if v is not None else v
 
 
 class DepartmentPayload(BaseModel):

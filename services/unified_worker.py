@@ -20,6 +20,7 @@ from common.config import get_settings
 from common.http import _default_headers
 from common.kafka import create_consumer, create_producer, event_type_from_message
 from common.logger import get_logger
+from services.infoboards_service.correct_cabinet_worker import _handle_with_retries as correct_cabinet_handle
 from services.infoboards_service.init_company_worker import _handle_with_retries as init_company_handle
 from services.reg_company_service.worker import _process_one as reg_company_process_one
 from services.users_service.auth_client import AuthClient
@@ -42,6 +43,7 @@ def _all_topics(settings: Any) -> list[str]:
         settings.KAFKA_SYNC_DEPARTMENTS_TOPIC,
         settings.KAFKA_ENABLE_REG_COMPANY_TOPIC,
         settings.KAFKA_DISABLE_REG_COMPANY_TOPIC,
+        settings.KAFKA_CORRECT_CABINET_TOPIC,
     ]
 
 
@@ -110,6 +112,9 @@ async def _dispatch_record(
         await init_company_handle(
             record, resolver, catalog_client, http_client, producer, settings
         )
+        return
+    if topic == settings.KAFKA_CORRECT_CABINET_TOPIC:
+        await correct_cabinet_handle(record, resolver, http_client, producer, settings)
         return
     if topic in (settings.KAFKA_ENABLE_REG_COMPANY_TOPIC, settings.KAFKA_DISABLE_REG_COMPANY_TOPIC):
         reg_company_process_one(_record_with_effective_topic(record, topic), settings)
