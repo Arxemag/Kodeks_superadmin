@@ -1,11 +1,12 @@
 """
-Создание таблиц для тестовой БД (в т.ч. в Docker).
+Создание таблиц и заливка справочника reg -> base_url.
 
 Запуск:
-  python scripts/init_db.py
+  python scripts/init_db.py            # только создать таблицы (DDL)
+  python scripts/init_db.py --seed     # создать таблицы + залить актуальные reg (СТАРОЕ В reg_services УДАЛЯЕТСЯ)
+  python scripts/init_db.py --seed --keep-existing   # залить reg, не очищая старые (upsert)
 
-Требует .env с DB_URL или PG_* (postgresql+asyncpg). Создаёт reg_services
-и department_service_mapping, вставляет тестовый reg при --seed.
+Требует .env с DB_URL или PG_* (postgresql+asyncpg).
 """
 from __future__ import annotations
 
@@ -19,22 +20,24 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from common.config import get_settings
 
 
+# Актуальный справочник reg -> base_url каталога (cabinet-0X). 350832 == cabinet-07 (он же platform.kodeks.expert).
+DEFAULT_REGS: list[tuple[str, str]] = [
+    ("465301", "https://cabinet-02.kodeks.expert"),
+    ("465302", "https://cabinet-03.kodeks.expert"),
+    ("465303", "https://cabinet-04.kodeks.expert"),
+    ("465304", "https://cabinet-05.kodeks.expert"),
+    ("465305", "https://cabinet-06.kodeks.expert"),
+    ("350832", "https://cabinet-07.kodeks.expert"),
+]
+
+
 async def _run() -> None:
-    parser = argparse.ArgumentParser(description="Создание таблиц в БД")
+    parser = argparse.ArgumentParser(description="Создание таблиц и заливка reg -> base_url")
+    parser.add_argument("--seed", action="store_true", help="Залить актуальные reg (см. DEFAULT_REGS)")
     parser.add_argument(
-        "--seed",
+        "--keep-existing",
         action="store_true",
-        help="Вставить тестовый reg в reg_services",
-    )
-    parser.add_argument(
-        "--reg",
-        default="350832",
-        help="Значение reg для --seed (по умолчанию 350832)",
-    )
-    parser.add_argument(
-        "--base-url",
-        default="https://platform.kodeks.expert",
-        help="base_url для --seed",
+        help="Не очищать reg_services перед заливкой (upsert поверх существующих)",
     )
     args = parser.parse_args()
 
@@ -51,11 +54,7 @@ async def _run() -> None:
     if not migrations:
         raise SystemExit(f"Миграции не найдены в {migrations_dir}")
 
-    engine = create_async_engine(
-        db_url,
-        pool_size=1,
-        pool_pre_ping=True,
-    )
+    engine = create_async_engine(db_url, pool_size=1, pool_pre_ping=True)
 
     print(f"Подключение к БД (таблицы: {tbl_reg!r}, {tbl_dsm!r})...")
     async with engine.begin() as conn:
@@ -67,15 +66,19 @@ async def _run() -> None:
 
     if args.seed:
         async with engine.begin() as conn:
-            await conn.execute(
-                text(f"""
-                    INSERT INTO {tbl_reg} (reg_number, base_url)
-                    VALUES (:reg, :base_url)
-                    ON CONFLICT (reg_number) DO UPDATE SET base_url = EXCLUDED.base_url
-                """),
-                {"reg": args.reg, "base_url": args.base_url},
-            )
-        print(f"  reg={args.reg!r} добавлен в {tbl_reg}")
+            if not args.keep_existing:
+                print(f"  Очистка {tbl_reg} (старые данные не нужны)...")
+                await conn.execute(text(f"TRUNCATE TABLE {tbl_reg}"))
+            for reg, base_url in DEFAULT_REGS:
+                await conn.execute(
+                    text(f"""
+                        INSERT INTO {tbl_reg} (reg_number, base_url)
+                        VALUES (:reg, :base_url)
+                        ON CONFLICT (reg_number) DO UPDATE SET base_url = EXCLUDED.base_url
+                    """),
+                    {"reg": reg, "base_url": base_url},
+                )
+            print(f"  Залито reg: {[r for r, _ in DEFAULT_REGS]}")
 
     await engine.dispose()
     print("Готово.")

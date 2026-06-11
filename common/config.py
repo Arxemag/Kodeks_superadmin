@@ -103,16 +103,16 @@ class Settings(BaseSettings):
 
     # --- correct_cabinet: уточнение кабинета по опроснику (удаление виджетов невыбранных вариантов) ---
     KAFKA_CORRECT_CABINET_TOPIC: str = Field(
-        "correct_cabinet",
-        description="Kafka topic: уточнение кабинета (link + questions[] с выбранными ответами)",
+        "correct-cabinet",
+        description="Kafka topic: уточнение кабинета (link + questions[]); на брокере имя через дефис",
     )
     KAFKA_CABINET_CORRECTED_TOPIC: str = Field(
         "cabinet-corrected",
         description="Kafka topic: ответ после уточнения (userId, reg, oldLink, link)",
     )
     KAFKA_CORRECT_CABINET_DLQ_TOPIC: str = Field(
-        "correct_cabinet-dlq",
-        description="Kafka DLQ topic for correct_cabinet",
+        "correct-cabinet-dlq",
+        description="Kafka DLQ topic for correct-cabinet",
     )
     KAFKA_CORRECT_CABINET_GROUP_ID: str = Field(
         "infoboards-correct-cabinet",

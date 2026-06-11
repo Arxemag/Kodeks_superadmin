@@ -23,6 +23,7 @@ from common.db import get_db, healthcheck_db, shutdown_db
 from common.exceptions import ServiceError
 from common.http import shutdown_http
 from common.logger import get_logger, get_trace_id, set_trace_id
+from services.auth_service import reg_admin
 from services.auth_service.metrics import active_requests, auth_errors_total
 from services.auth_service.schemas import ErrorResponse, LoginRequest, OkResponse
 from services.auth_service.service import AuthService
@@ -146,6 +147,9 @@ def create_app() -> FastAPI:
         if "items" in data:
             return InfoboardsListResponse(**data)
         return InfoboardLinkResponse(**data)
+
+    # Мини-админка reg_services (UI на /admin/reg-services, API /api/expert/reg-services)
+    app.include_router(reg_admin.router)
 
     return app
 

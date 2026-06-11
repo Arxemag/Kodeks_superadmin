@@ -1,0 +1,28 @@
+name: Deploy release -> server
+
+# Авто-деплой: при пуше в ветку release заходим по SSH на сервер,
+# подтягиваем release и пересобираем контейнеры. .env живёт на сервере (в репозиторий не коммитится).
+on:
+  push:
+    branches: [release]
+  workflow_dispatch: {}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: SSH deploy
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          port: 22
+          script: |
+            set -e
+            cd /home/user/kodeks_superadmin
+            test -f .env || { echo "НЕТ .env на сервере — создайте прод-.env"; exit 1; }
+            git fetch --all --prune
+            git reset --hard origin/release
+            docker compose up -d --build
+            docker compose ps

@@ -30,6 +30,7 @@ def unified_settings() -> MagicMock:
     s.KAFKA_SYNC_DEPARTMENTS_TOPIC = "sync_departments"
     s.KAFKA_ENABLE_REG_COMPANY_TOPIC = "enable_reg_company"
     s.KAFKA_DISABLE_REG_COMPANY_TOPIC = "disable_reg_company"
+    s.KAFKA_CORRECT_CABINET_TOPIC = "correct-cabinet"
     s.KAFKA_DLQ_TOPIC = "users-dlq"
     s.KAFKA_INIT_COMPANY_DLQ_TOPIC = "init_company-dlq"
     s.USERS_RETRY_ATTEMPTS = 2
@@ -38,10 +39,10 @@ def unified_settings() -> MagicMock:
     return s
 
 
-def test_all_topics_returns_seven_topics(unified_settings: MagicMock) -> None:
-    """_all_topics возвращает 7 топиков в нужном порядке (включая sync_departments)."""
+def test_all_topics_returns_all_topics(unified_settings: MagicMock) -> None:
+    """_all_topics возвращает 8 топиков в нужном порядке (включая sync_departments и correct_cabinet)."""
     topics = _all_topics(unified_settings)
-    assert len(topics) == 7
+    assert len(topics) == 8
     assert topics[0] == "create-user"
     assert topics[1] == "update-user"
     assert topics[2] == "update-user-departments"
@@ -49,6 +50,7 @@ def test_all_topics_returns_seven_topics(unified_settings: MagicMock) -> None:
     assert topics[4] == "sync_departments"
     assert topics[5] == "enable_reg_company"
     assert topics[6] == "disable_reg_company"
+    assert topics[7] == "correct-cabinet"
 
 
 def test_effective_topic_from_record_topic() -> None:

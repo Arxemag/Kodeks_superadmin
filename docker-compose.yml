@@ -1,8 +1,6 @@
-# Kodeks superadmin: Auth API + единый Kafka worker (одна группа, все топики).
-# БД — отдельно (свой контейнер или хост). В .env укажите хост БД: из контейнера
-# это имя контейнера с PostgreSQL или host.docker.internal, если БД на хосте.
-# При деплое подставьте KAFKA_BOOTSTRAP_SERVERS и DB_URL (или PG_*).
-
+# Kodeks superadmin: Auth API (8000) + единый Kafka worker + chromium (для Playwright).
+# БД — ВНЕШНЯЯ (уже стоит на сервере). В .env: DB_URL на host.docker.internal:5432 (см. extra_hosts),
+# KAFKA_BOOTSTRAP_SERVERS на брокер. chromium наружу НЕ публикуется (нужен только воркеру по сети compose).
 services:
   chromium:
     image: browserless/chrome:latest
@@ -11,8 +9,6 @@ services:
       - CONNECTION_TIMEOUT=120000
       - MAX_CONCURRENT_SESSIONS=5
       - PREBOOT_CHROME=true
-    ports:
-      - "${CHROMIUM_PORT:-3000}:3000"
     restart: unless-stopped
 
   auth-api:
@@ -24,6 +20,8 @@ services:
     environment:
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - CHROMIUM_WS_ENDPOINT=${CHROMIUM_WS_ENDPOINT:-ws://chromium:3000}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # доступ к postgres/kafka, опубликованным на хосте
     depends_on:
       - chromium
     restart: unless-stopped
@@ -35,6 +33,8 @@ services:
     environment:
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - CHROMIUM_WS_ENDPOINT=${CHROMIUM_WS_ENDPOINT:-ws://chromium:3000}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       - chromium
     restart: unless-stopped

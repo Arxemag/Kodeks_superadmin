@@ -99,7 +99,7 @@ python main_unified_worker.py
 | auth-api | `python main.py`             | 8000                 |
 | worker   | `python main_unified_worker.py` | метрики 9100      |
 
-Единый воркер: одна consumer group (`KAFKA_GROUP_ID`), подписка на все топики (create-user, update-user, update-user-departments, init_company, sync_departments, enable_reg_company, disable_reg_company, **correct_cabinet**). Маршрутизация по эффективному топику: `event_type` из тела сообщения или `record.topic`.
+Единый воркер: одна consumer group (`KAFKA_GROUP_ID`), подписка на все топики (create-user, update-user, update-user-departments, init_company, sync_departments, enable_reg_company, disable_reg_company, **correct-cabinet**). Маршрутизация по эффективному топику: `event_type` из тела сообщения или `record.topic`.
 
 Переменные окружения — из файла `.env` (см. раздел «Деплой на сервер» и `.env.example`).
 
@@ -118,17 +118,17 @@ python main_unified_worker.py
 - `GET /api/expert/health`, `GET /api/expert/metrics`
 
 **Единый Kafka worker** (`main_unified_worker.py`) — одна consumer group, все топики:
-- Топики: `create-user`, `update-user`, `update-user-departments`, `init_company`, `sync_departments`, `enable_reg_company`, `disable_reg_company`, `correct_cabinet`
-- Маршрутизация по эффективному топику (`event_type` из сообщения или `record.topic`), обработчики: users, init_company (в т.ч. sync_departments), reg_company, correct_cabinet
+- Топики: `create-user`, `update-user`, `update-user-departments`, `init_company`, `sync_departments`, `enable_reg_company`, `disable_reg_company`, `correct-cabinet`
+- Маршрутизация по эффективному топику (`event_type` из сообщения или `record.topic`), обработчики: users, init_company (в т.ч. sync_departments), reg_company, correct-cabinet
 - Метрики на `UNIFIED_WORKER_METRICS_PORT` (9100)
 
 Отдельные воркеры (`main_users.py`, `main_init_company.py`, `main_reg_company.py`) по-прежнему в репозитории — можно запускать их вместо единого, с разными группами (KAFKA_GROUP_ID, KAFKA_INIT_COMPANY_GROUP_ID, KAFKA_REG_COMPANY_GROUP_ID).
 
-## Уточнение кабинета (correct_cabinet)
+## Уточнение кабинета (correct-cabinet)
 
 Поток уточнения «цифрового кабинета» по опроснику: по ответам клиента в каталоге **удаляются виджеты невыбранных вариантов**, остаются только нужные. Сейчас поддержан кабинет **«Эколог»**.
 
-- **Вход (consume):** топик `correct_cabinet`
+- **Вход (consume):** топик `correct-cabinet`
   ```json
   {
     "userId": 1,
@@ -138,11 +138,11 @@ python main_unified_worker.py
   }
   ```
 - **Выход (produce):** топик `cabinet-corrected` — `{ "userId", "reg", "oldLink", "link" }` (ссылка та же, что пришла).
-- **DLQ:** `correct_cabinet-dlq` (невалидный payload, `REG_NOT_FOUND`, исчерпание ретраев).
+- **DLQ:** `correct-cabinet-dlq` (невалидный payload, `REG_NOT_FOUND`, исчерпание ретраев).
 
 **Логика:** хост каталога берётся по `reg` из `reg_services`; админ-cookies — логином в каталог (`ADMIN_LOGIN/ADMIN_PASSWORD`). Из `link` берётся родительский кабинет; в его под-кабинетах (по темам опросника) удаляются виджеты **невыбранных** вариантов. Соответствие «ответ → заголовок виджета» — из справочника `services/infoboards_service/ecology_questionnaire_map.json` (резолвит расхождения формулировок, напр. «контроль»↔«надзор»). **Не трогаются:** «Вернуться назад», «Справочная информация»; вопрос с ответом **«Выбрать всё»** пропускается целиком. Обрабатывается единым воркером автоматически — отдельный процесс не нужен.
 
-### Что прописать на ПРОД-сервере для correct_cabinet
+### Что прописать на ПРОД-сервере для correct-cabinet
 
 1. **БД `reg_services`** — для каждой компании, использующей уточнение, должна быть строка `reg → base_url` каталога. Без неё — `REG_NOT_FOUND` (сообщение уйдёт в DLQ). Пример (или `python scripts/seed_reg_service.py`):
    ```sql
@@ -151,15 +151,15 @@ python main_unified_worker.py
    ON CONFLICT (reg_number) DO UPDATE SET base_url = EXCLUDED.base_url;
    ```
 2. **`.env` на проде:**
-   - `KAFKA_BOOTSTRAP_SERVERS` — адрес Kafka сервера (с которой приходит `correct_cabinet`).
+   - `KAFKA_BOOTSTRAP_SERVERS` — адрес Kafka сервера (с которой приходит `correct-cabinet`).
    - `ADMIN_LOGIN`, `ADMIN_PASSWORD` — админ каталога (под ним правятся виджеты).
    - Имена топиков менять только если у фронта другие (по умолчанию уже заданы):
-     `KAFKA_CORRECT_CABINET_TOPIC=correct_cabinet`, `KAFKA_CABINET_CORRECTED_TOPIC=cabinet-corrected`, `KAFKA_CORRECT_CABINET_DLQ_TOPIC=correct_cabinet-dlq`.
+     `KAFKA_CORRECT_CABINET_TOPIC=correct-cabinet`, `KAFKA_CABINET_CORRECTED_TOPIC=cabinet-corrected`, `KAFKA_CORRECT_CABINET_DLQ_TOPIC=correct-cabinet-dlq`.
    - **`CORRECT_CABINET_DRY_RUN=true`** — для безопасного первого запуска: воркер принимает сообщения, пишет план в лог и отвечает в `cabinet-corrected`, но **виджеты не удаляет**. Убедились по логам, что план верный → ставим `false` (боевой режим).
    - (опц.) `CORRECT_CABINET_METRICS_PORT` (9104) — только если запускать отдельным процессом; в едином воркере не нужен.
 3. **Сеть:** процесс-воркер должен дотягиваться до каталога (`base_url`, HTTPS, TLS-серт должен быть валиден) и до БД (`reg_services`). Для внутренних хостов каталога — соответствующий VPN/доступ на сервере.
 4. **Справочник** `services/infoboards_service/ecology_questionnaire_map.json` поставляется с кодом и грузится автоматически (ничего отдельно класть не нужно). При изменении набора/названий виджетов в каталоге — перегенерировать запрос (`scripts/gen_widget_query.py`) и сверить справочник.
-5. **Запуск:** единый воркер (`python main_unified_worker.py` / `docker compose up -d worker`) подписывается на `correct_cabinet` сам — отдельный процесс не требуется.
+5. **Запуск:** единый воркер (`python main_unified_worker.py` / `docker compose up -d worker`) подписывается на `correct-cabinet` сам — отдельный процесс не требуется.
 
 Ручной прогон без Kafka (для проверки): `python scripts/cabinet_edit_probe.py --base-url https://<host>/ --insecure --correct payload.json --dry-run` (см. шапку файла).
 
