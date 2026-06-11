@@ -320,7 +320,9 @@ async def crawl_boards(
         board_id, depth, link_header = queue.popleft()
         try:
             board = await fetch_board(base_url, client, cookies, board_id)
-        except ParseError as e:
+        except (ParseError, NetworkError) as e:
+            # Битая/недоступная ссылка на под-кабинет (борда нет -> 404 GRAPHQL_4XX,
+            # либо BOARD_NOT_FOUND, либо таймаут) НЕ должна ронять весь обход — пропускаем борд.
             logger.warning("crawl: борд %r пропущен (%s)", board_id, getattr(e, "code", e))
             continue
         boards[board_id] = board

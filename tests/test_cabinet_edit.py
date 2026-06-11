@@ -121,6 +121,35 @@ async def test_unknown_question_skipped(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_crawl_skips_broken_subcabinet(monkeypatch):
+    """Битая ссылка на под-кабинет (404 -> NetworkError) не роняет обход; цель находится."""
+    tree = dict(TREE)
+    # у ПРОМЕЖУТОЧНОГО (R2) появляется ссылка на несуществующий борд RBAD + рабочая на цель R3
+    tree["R2"] = BoardConfig("R2", "a", "Промежуточный", None,
+                             [_link("битая", "RBAD"), _link("к цели", "R3"), _back()])
+
+    async def fake_fetch_board(base_url, client, cookies, board_id):
+        if board_id == "RBAD":
+            from common.exceptions import NetworkError
+            raise NetworkError(code="GRAPHQL_4XX", message="GraphQL status=404 P000S not found")
+        b = tree.get(board_id)
+        if b is None:
+            from common.exceptions import ParseError
+            raise ParseError(code="BOARD_NOT_FOUND", message=board_id)
+        return BoardConfig(b.id, b.author, b.title, b.search_string, list(b.widgets))
+    monkeypatch.setattr(cabinet_edit, "fetch_board", fake_fetch_board)
+
+    link = "https://host/docs/?nd=1&infoboard=R0"
+    questions = [{"question": "Тестовый вопрос про процедуры", "answers": ["Оставить А"]}]
+    plans = await correct_cabinet("https://host", None, {}, link, questions, dry_run=True, qmap=QMAP)
+
+    assert len(plans) == 1
+    assert plans[0].action == "prune"          # цель R3 найдена, несмотря на битый RBAD
+    assert plans[0].sub_id == "R3"
+    assert set(plans[0].delete_headers) == {"Виджет Б", "Виджет В"}
+
+
+@pytest.mark.asyncio
 async def test_apply_calls_set_widgets_with_kept(monkeypatch):
     """Вне dry-run вызывается set_widgets с виджетами БЕЗ удаляемых, но С системными и выбранным."""
     _patch_tree(monkeypatch, TREE)
