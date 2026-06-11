@@ -18,12 +18,13 @@ __pycache__
 *.md
 !README.md
 
-# Тесты и скрипты разработки (в образ не копируем)
+# Тесты и доки в образ не копируем; scripts НУЖЕН (init_db, migrations, seed)
 tests
-scripts
 docs
 agent-transcripts
 mcps
+# временные/отладочные артефакты в scripts не тащим
+scripts/_*
 
 # Локальные конфиги и секреты
 .env

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections import deque
 from dataclasses import dataclass, field
 from json import JSONDecodeError
 from pathlib import Path
@@ -281,11 +282,70 @@ def extract_sub_cabinets(parent: BoardConfig) -> dict[str, str]:
     return subs
 
 
+async def crawl_boards(
+    base_url: str,
+    client: httpx.AsyncClient,
+    cookies: dict[str, str],
+    root_id: str,
+    *,
+    max_depth: int = 6,
+    max_boards: int = 300,
+) -> tuple[dict[str, BoardConfig], dict[str, list[str]]]:
+    """
+    Обойти дерево кабинетов ВГЛУБЬ от root_id по ссылкам (LinksWidget), а не только один уровень:
+    целевой под-кабинет может лежать на несколько уровней ниже родителя из payload.
+
+    Возвращает:
+      boards:  {board_id: BoardConfig} — все посещённые борды (уже с виджетами);
+      by_name: {norm(заголовок): [board_id, ...]} — индекс для поиска под-кабинета по названию;
+               индексируем и по собственному title борда, и по заголовку ссылки, что привела к нему.
+
+    Защита: visited-set (от циклов), ограничение глубины (max_depth) и числа бордов (max_boards);
+    в служебные разделы (Вернуться назад / Справочная) не углубляемся.
+    """
+    boards: dict[str, BoardConfig] = {}
+    by_name: dict[str, list[str]] = {}
+    seen: set[str] = {root_id}
+    queue: deque[tuple[str, int, str | None]] = deque([(root_id, 0, None)])
+
+    def _index(key: str | None, board_id: str) -> None:
+        nk = _norm(key)
+        if not nk:
+            return
+        lst = by_name.setdefault(nk, [])
+        if board_id not in lst:
+            lst.append(board_id)
+
+    while queue and len(boards) < max_boards:
+        board_id, depth, link_header = queue.popleft()
+        try:
+            board = await fetch_board(base_url, client, cookies, board_id)
+        except ParseError as e:
+            logger.warning("crawl: борд %r пропущен (%s)", board_id, getattr(e, "code", e))
+            continue
+        boards[board_id] = board
+        _index(link_header, board_id)
+        _index(board.title, board_id)
+        if depth >= max_depth:
+            continue
+        for child_id, child_header in extract_sub_cabinets(board).items():
+            if child_id in seen or _norm(child_header) in SYSTEM_KEEP:
+                continue
+            seen.add(child_id)
+            queue.append((child_id, depth + 1, child_header))
+
+    logger.info(
+        "crawl от %r: бордов=%s (глубина<=%s), названий в индексе=%s",
+        root_id, len(boards), max_depth, len(by_name),
+    )
+    return boards, by_name
+
+
 @dataclass
 class QuestionPlan:
     """План по одному вопросу опросника."""
     question: str
-    action: str  # 'skip-select-all' | 'no-sub' | 'prune'
+    action: str  # 'skip-select-all' | 'unknown-question' | 'no-sub' | 'ambiguous' | 'prune'
     sub_id: str | None = None
     keep_headers: list[str] = field(default_factory=list)
     delete_headers: list[str] = field(default_factory=list)
@@ -329,17 +389,20 @@ async def correct_cabinet(
     qmap: list[dict[str, Any]] | None = None,
 ) -> list[QuestionPlan]:
     """
-    По опроснику почистить под-кабинеты родителя parent_link, опираясь на справочник.
+    По опроснику почистить под-кабинеты, опираясь на справочник. parent_link — точка входа;
+    целевой под-кабинет ищется ВГЛУБЬ по всему дереву (он может лежать на несколько уровней ниже).
     Удаляем ТОЛЬКО виджеты известных вариантов ответа, которые клиент НЕ выбрал; всё остальное
     (навигация, справка, выбранные варианты, неизвестные виджеты) остаётся. 'Выбрать всё' -> вопрос не трогаем.
-    Под-кабинет находим по sub_block из справочника среди ссылок родителя; расхождения текстов
-    ответ/заголовок резолвятся справочником (option -> точный widget_header).
+    Под-кабинет находим по sub_block из справочника среди всех бордов дерева (по title/заголовку ссылки);
+    при неоднозначности (>1 совпадения) кабинет НЕ трогаем (action='ambiguous').
     """
     qmap = qmap if qmap is not None else load_questionnaire_map()
     parent_id = parse_infoboard_id(parent_link)
-    parent = await fetch_board(base_url, client, cookies, parent_id)
-    sub_by_block = {_norm(block): sid for sid, block in extract_sub_cabinets(parent).items()}
-    logger.info("correct_cabinet parent=%r sub_by_block=%s", parent_id, sub_by_block)
+    boards, by_name = await crawl_boards(base_url, client, cookies, parent_id)
+    logger.info(
+        "correct_cabinet parent=%r поддерево: %s",
+        parent_id, {bid: b.title for bid, b in boards.items()},
+    )
 
     plans: list[QuestionPlan] = []
     for q in questions:
@@ -354,28 +417,42 @@ async def correct_cabinet(
             plans.append(QuestionPlan(question, "unknown-question"))
             logger.warning("Q %r -> нет в справочнике -> пропуск", question[:60])
             continue
-        sub_id = sub_by_block.get(_norm(m["sub_block"]))
-        if not sub_id:
+        matches = by_name.get(_norm(m["sub_block"]), [])
+        if not matches:
             plans.append(QuestionPlan(question, "no-sub"))
-            logger.warning("Q %r -> под-кабинет %r не найден у родителя -> пропуск", question[:60], m["sub_block"])
+            logger.warning("Q %r -> под-кабинет %r не найден в дереве -> пропуск", question[:60], m["sub_block"])
             continue
+        if len(matches) > 1:
+            plans.append(QuestionPlan(question, "ambiguous", None, [], list(matches)))
+            logger.error(
+                "Q %r -> под-кабинет %r найден в %s местах %s -> НЕ трогаем (нужно уточнение)",
+                question[:60], m["sub_block"], len(matches), matches,
+            )
+            continue
+        sub_id = matches[0]
+        sub = boards[sub_id]
         selected = {_norm(a) for a in answers if _norm(a) != _norm(SELECT_ALL)}
         # к удалению — заголовки виджетов НЕвыбранных вариантов (из справочника)
         delete_headers = {
             _norm(header) for opt, header in m["answers"].items()
             if header and _norm(opt) not in selected
         }
-        sub = await fetch_board(base_url, client, cookies, sub_id)
         keep, delete = [], []
         for w in sub.widgets:
-            if _norm(w.get("header")) in delete_headers:
+            h = _norm(w.get("header"))
+            if h in SYSTEM_KEEP:           # навигация/справка — НИКОГДА не трогаем
+                keep.append(w.get("header"))
+            elif h in delete_headers:
                 delete.append(w.get("header"))
             else:
                 keep.append(w.get("header"))
         plans.append(QuestionPlan(question, "prune", sub_id, keep, delete))
-        logger.info("Q %r -> sub=%s delete=%s", question[:60], sub_id, delete)
+        logger.info("Q %r -> sub=%s(%r) delete=%s", question[:60], sub_id, sub.title, delete)
         if not dry_run and delete:
-            kept_widgets = [w for w in sub.widgets if _norm(w.get("header")) not in delete_headers]
+            kept_widgets = [
+                w for w in sub.widgets
+                if _norm(w.get("header")) in SYSTEM_KEEP or _norm(w.get("header")) not in delete_headers
+            ]
             await set_widgets(base_url, client, cookies, sub, widgets_to_input(kept_widgets))
     return plans
 

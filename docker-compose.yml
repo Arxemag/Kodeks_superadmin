@@ -33,6 +33,9 @@ services:
     environment:
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - CHROMIUM_WS_ENDPOINT=${CHROMIUM_WS_ENDPOINT:-ws://chromium:3000}
+      # Воркер ходит за куками админа по HTTP к Auth API ПО ИМЕНИ СЕРВИСА compose,
+      # а не на 127.0.0.1 (это его собственный контейнер, где API нет). Перебивает .env.
+      - AUTH_SERVICE_URL=http://auth-api:8000
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:

@@ -2,8 +2,9 @@
 Kafka worker для топика correct_cabinet (уточнение кабинета по опроснику).
 
 Поток: payload (userId, reg, link, questions[]) -> base_url по reg (reg_services) + админ-cookies
-(AuthService) -> correct_cabinet(): в под-кабинетах родителя link удалить виджеты невыбранных
-вариантов (по справочнику) -> ответ в топик cabinet-corrected (userId, reg, oldLink, link).
+(AuthService) -> correct_cabinet(): обойти дерево кабинетов от link ВГЛУБЬ, в целевых под-кабинетах
+(на любом уровне) удалить виджеты невыбранных вариантов (по справочнику) -> ответ в топик
+cabinet-corrected (userId, reg, oldLink, link).
 
 Ошибки валидации / REG_NOT_FOUND -> DLQ без retry. NetworkError/прочие AuthError -> retry с backoff, затем DLQ.
 Используется единым воркером (unified_worker) или как отдельный процесс (run_worker).
