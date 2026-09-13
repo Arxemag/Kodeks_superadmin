@@ -58,6 +58,7 @@ query QueryBoardOne($id: String!) {
       id
       author
       title
+      hiddenOnStartPage
       searchString {
         header
         palette {
@@ -108,6 +109,9 @@ class BoardConfig:
     title: str
     search_string: dict[str, Any] | None
     widgets: list[dict[str, Any]] = field(default_factory=list)
+    # Видимость на стартовой странице ТЭ. editConfig — полная замена конфига, поэтому
+    # флаг нужно читать и возвращать обратно, иначе под-кабинеты всплывут на главной.
+    hidden_on_start_page: bool | None = None
 
 
 def parse_infoboard_id(link: str) -> str:
@@ -205,6 +209,7 @@ async def fetch_board(
         title=str(one.get("title") or ""),
         search_string=one.get("searchString"),
         widgets=list(widgets),
+        hidden_on_start_page=one.get("hiddenOnStartPage"),
     )
 
 
@@ -241,11 +246,39 @@ async def set_widgets(
     }
     if board.search_string is not None:
         config_input["searchString"] = board.search_string
+    # Возвращаем флаг как есть: editConfig заменяет конфиг целиком, и без него борд
+    # потеряет скрытие и появится плиткой на стартовой странице ТЭ.
+    if board.hidden_on_start_page is not None:
+        config_input["hiddenOnStartPage"] = board.hidden_on_start_page
     logger.debug(
         "set_widgets board_id=%r widgets_count=%s headers=%s",
         board.id, len(widget_inputs), [w.get("header") for w in widget_inputs],
     )
     await _graphql(base_url, client, cookies, MUTATION_EDIT_CONFIG, {"ConfigInput": config_input})
+
+
+def board_to_snapshot(board: BoardConfig) -> dict[str, Any]:
+    """Конфиг борда в вид для хранения (JSONB в cabinet_snapshots)."""
+    return {
+        "id": board.id,
+        "author": board.author,
+        "title": board.title,
+        "searchString": board.search_string,
+        "hiddenOnStartPage": board.hidden_on_start_page,
+        "widgets": list(board.widgets),
+    }
+
+
+def board_from_snapshot(data: dict[str, Any]) -> BoardConfig:
+    """Обратное преобразование снимка в BoardConfig."""
+    return BoardConfig(
+        id=str(data.get("id") or ""),
+        author=str(data.get("author") or ""),
+        title=str(data.get("title") or ""),
+        search_string=data.get("searchString"),
+        widgets=list(data.get("widgets") or []),
+        hidden_on_start_page=data.get("hiddenOnStartPage"),
+    )
 
 
 # --- Опросник -> чистка под-кабинетов -------------------------------------------------
@@ -351,6 +384,59 @@ class QuestionPlan:
     sub_id: str | None = None
     keep_headers: list[str] = field(default_factory=list)
     delete_headers: list[str] = field(default_factory=list)
+    # Заголовки виджетов, которые возвращаются из снимка (были удалены прошлым уточнением).
+    restore_headers: list[str] = field(default_factory=list)
+
+
+def plan_widgets_from_snapshot(
+    snapshot_widgets: list[dict[str, Any]],
+    current_widgets: list[dict[str, Any]],
+    delete_headers: set[str],
+) -> tuple[list[dict[str, Any]], list[str], list[str]]:
+    """
+    Собрать итоговый набор виджетов от ЭТАЛОНА (снимка), а не от текущего состояния борда.
+
+    Возвращает (итоговый список для editConfig, восстановленные заголовки, удаляемые заголовки).
+
+    Правила:
+      - порядок берём из снимка; виджет, который сейчас на борде есть, переносим КАК ЕСТЬ
+        (со своим widgetUuid), иначе создастся дубль;
+      - виджет из снимка, которого сейчас нет и который не в списке на удаление, ВОЗВРАЩАЕМ
+        с widgetUuid="" — новый uuid присвоит каталог (иначе каталог не примет чужой uuid);
+      - системные виджеты (навигация/справка) не удаляем никогда;
+      - виджеты, появившиеся на борде после снимка (в снимке их нет), сохраняем в конце —
+        чужие ручные правки не теряем.
+    """
+    current_by_header: dict[str, dict[str, Any]] = {}
+    for w in current_widgets:
+        current_by_header.setdefault(_norm(w.get("header")), w)
+
+    result: list[dict[str, Any]] = []
+    restored: list[str] = []
+    for w in snapshot_widgets:
+        h = _norm(w.get("header"))
+        if h not in SYSTEM_KEEP and h in delete_headers:
+            continue
+        current = current_by_header.get(h)
+        if current is not None:
+            result.append(current)
+            continue
+        revived = dict(w)
+        revived["widgetUuid"] = ""
+        result.append(revived)
+        restored.append(w.get("header") or "")
+
+    snapshot_headers = {_norm(w.get("header")) for w in snapshot_widgets}
+    for w in current_widgets:
+        if _norm(w.get("header")) not in snapshot_headers:
+            result.append(w)
+
+    result_headers = {_norm(w.get("header")) for w in result}
+    deleted = [
+        w.get("header") or "" for w in current_widgets
+        if _norm(w.get("header")) not in result_headers
+    ]
+    return result, restored, deleted
 
 
 # Справочник «вопрос -> виджеты» лежит JSON-файлом рядом с модулем (см. gen через scripts).
@@ -389,6 +475,9 @@ async def correct_cabinet(
     *,
     dry_run: bool = False,
     qmap: list[dict[str, Any]] | None = None,
+    reg: str | None = None,
+    store: Any = None,
+    restore: bool = True,
 ) -> list[QuestionPlan]:
     """
     По опроснику почистить под-кабинеты, опираясь на справочник. parent_link — точка входа;
@@ -397,6 +486,11 @@ async def correct_cabinet(
     (навигация, справка, выбранные варианты, неизвестные виджеты) остаётся. 'Выбрать всё' -> вопрос не трогаем.
     Под-кабинет находим по sub_block из справочника среди всех бордов дерева (по title/заголовку ссылки);
     при неоднозначности (>1 совпадения) кабинет НЕ трогаем (action='ambiguous').
+
+    store + reg + restore: при первом проходе снимается эталон каждого борда дерева, и дальше
+    каждое уточнение считается ОТ ЭТАЛОНА. Поэтому повторный опросник умеет и удалять, и
+    возвращать ранее удалённые виджеты. Снимок пишется и в dry_run — чтение безопасно, а к
+    моменту боевого прогона эталон уже будет в БД.
     """
     qmap = qmap if qmap is not None else load_questionnaire_map()
     parent_id = parse_infoboard_id(parent_link)
@@ -405,6 +499,13 @@ async def correct_cabinet(
         "correct_cabinet parent=%r поддерево: %s",
         parent_id, {bid: b.title for bid, b in boards.items()},
     )
+
+    use_snapshots = bool(store is not None and reg and restore)
+    if store is not None and reg:
+        # Эталон снимаем со всего дерева, а не только с изменяемых бордов: следующий опросник
+        # может задеть другой под-кабинет, и к тому моменту исходный состав должен быть сохранён.
+        for board_id, board in boards.items():
+            await store.save_if_absent(reg, board_id, board.title, board_to_snapshot(board))
 
     plans: list[QuestionPlan] = []
     for q in questions:
@@ -439,23 +540,37 @@ async def correct_cabinet(
             _norm(header) for opt, header in m["answers"].items()
             if header and _norm(opt) not in selected
         }
-        keep, delete = [], []
-        for w in sub.widgets:
-            h = _norm(w.get("header"))
-            if h in SYSTEM_KEEP:           # навигация/справка — НИКОГДА не трогаем
-                keep.append(w.get("header"))
-            elif h in delete_headers:
-                delete.append(w.get("header"))
-            else:
-                keep.append(w.get("header"))
-        plans.append(QuestionPlan(question, "prune", sub_id, keep, delete))
-        logger.info("Q %r -> sub=%s(%r) delete=%s", question[:60], sub_id, sub.title, delete)
-        if not dry_run and delete:
-            kept_widgets = [
+
+        snapshot = await store.get(reg, sub_id) if use_snapshots else None
+        if snapshot is not None:
+            # Эталонный путь: итоговый набор считаем от снимка — умеем и убирать, и возвращать.
+            base_widgets = list(board_from_snapshot(snapshot).widgets)
+            final_widgets, restored, deleted = plan_widgets_from_snapshot(
+                base_widgets, sub.widgets, delete_headers,
+            )
+            keep = [w.get("header") for w in final_widgets]
+        else:
+            # Снимка нет (борд появился позже или восстановление отключено) — прежнее поведение:
+            # считаем от текущего состояния, только удаление.
+            restored = []
+            deleted = [
+                w.get("header") or "" for w in sub.widgets
+                if _norm(w.get("header")) not in SYSTEM_KEEP and _norm(w.get("header")) in delete_headers
+            ]
+            final_widgets = [
                 w for w in sub.widgets
                 if _norm(w.get("header")) in SYSTEM_KEEP or _norm(w.get("header")) not in delete_headers
             ]
-            await set_widgets(base_url, client, cookies, sub, widgets_to_input(kept_widgets))
+            keep = [w.get("header") for w in final_widgets]
+
+        plans.append(QuestionPlan(question, "prune", sub_id, keep, deleted, restored))
+        logger.info(
+            "Q %r -> sub=%s(%r) delete=%s restore=%s (от %s)",
+            question[:60], sub_id, sub.title, deleted, restored,
+            "снимка" if snapshot is not None else "текущего состояния",
+        )
+        if not dry_run and (deleted or restored):
+            await set_widgets(base_url, client, cookies, sub, widgets_to_input(final_widgets))
     return plans
 
 

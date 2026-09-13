@@ -5,6 +5,8 @@
 """
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from services.infoboards_service import cabinet_edit
@@ -51,6 +53,16 @@ TREE = {
     "R2": BoardConfig("R2", "a", "Промежуточный", None, [_link("к цели", "R3"), _back()]),
     "R3": BoardConfig("R3", "a", "Целевой под-кабинет", None, list(TARGET_WIDGETS)),
 }
+
+
+# То же дерево ПОСЛЕ первого уточнения: в цели остались только «Виджет А» и навигация.
+PRUNED_TREE = dict(TREE)
+PRUNED_TREE["R3"] = BoardConfig("R3", "a", "Целевой под-кабинет", None, [_w("Виджет А"), _back()])
+
+
+async def _noop_set_widgets(base_url, client, cookies, board, widget_inputs) -> None:
+    """Заглушка записи: тесту важен только расчёт плана."""
+    return None
 
 
 def _patch_tree(monkeypatch, tree: dict[str, BoardConfig]) -> None:
@@ -167,3 +179,137 @@ async def test_apply_calls_set_widgets_with_kept(monkeypatch):
 
     assert captured["board_id"] == "R3"
     assert set(captured["headers"]) == {"Виджет А", cabinet_edit.BACK_HEADER}  # Б и В удалены
+
+
+# --- Снимок кабинета и восстановление виджетов при повторном опроснике ----------------
+
+
+class StubSnapshotStore:
+    """In-memory аналог CabinetSnapshotStore: эталон пишется один раз и не перезаписывается."""
+
+    def __init__(self) -> None:
+        self.data: dict[tuple[str, str], dict] = {}
+        self.save_calls: list[str] = []
+
+    async def save_if_absent(self, reg: str, board_id: str, title: str, config: dict) -> bool:
+        self.save_calls.append(board_id)
+        key = (reg, board_id)
+        if key in self.data:
+            return False
+        self.data[key] = json.loads(json.dumps(config, ensure_ascii=False))
+        return True
+
+    async def get(self, reg: str, board_id: str) -> dict | None:
+        value = self.data.get((reg, board_id))
+        return json.loads(json.dumps(value, ensure_ascii=False)) if value is not None else None
+
+
+@pytest.mark.asyncio
+async def test_snapshot_taken_for_whole_tree(monkeypatch):
+    """Эталон снимается со ВСЕХ бордов дерева, а не только с изменяемого, и в dry-run тоже."""
+    _patch_tree(monkeypatch, TREE)
+    store = StubSnapshotStore()
+
+    await correct_cabinet(
+        "https://host", None, {}, "https://host/docs/?nd=1&infoboard=R0",
+        [{"question": "Тестовый вопрос про процедуры", "answers": ["Оставить А"]}],
+        dry_run=True, qmap=QMAP, reg="465302", store=store,
+    )
+
+    assert sorted(store.save_calls) == ["R0", "R1", "R2", "R3"]
+    assert [w["header"] for w in store.data[("465302", "R3")]["widgets"]] == [
+        "Виджет А", "Виджет Б", "Виджет В", cabinet_edit.BACK_HEADER,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_snapshot_not_overwritten_on_second_pass(monkeypatch):
+    """Повторный проход не перезаписывает эталон: снимок остаётся исходным."""
+    _patch_tree(monkeypatch, TREE)
+    monkeypatch.setattr(cabinet_edit, "set_widgets", _noop_set_widgets)
+    store = StubSnapshotStore()
+    link = "https://host/docs/?nd=1&infoboard=R0"
+    question = [{"question": "Тестовый вопрос про процедуры", "answers": ["Оставить А"]}]
+
+    await correct_cabinet("https://host", None, {}, link, question, qmap=QMAP, reg="465302", store=store)
+    # второй проход идёт уже по УРЕЗАННОМУ дереву
+    _patch_tree(monkeypatch, PRUNED_TREE)
+    await correct_cabinet("https://host", None, {}, link, question, qmap=QMAP, reg="465302", store=store)
+
+    assert len(store.data[("465302", "R3")]["widgets"]) == 4  # эталон не тронут
+
+
+@pytest.mark.asyncio
+async def test_second_pass_restores_deselected_widget(monkeypatch):
+    """Клиент выбрал больше вариантов — ранее удалённый виджет возвращается с пустым widgetUuid."""
+    _patch_tree(monkeypatch, PRUNED_TREE)
+    store = StubSnapshotStore()
+    store.data[("465302", "R3")] = {
+        "id": "R3", "author": "a", "title": "Целевой под-кабинет",
+        "searchString": None, "hiddenOnStartPage": True,
+        "widgets": [w for w in TARGET_WIDGETS],
+    }
+    captured = {}
+
+    async def fake_set_widgets(base_url, client, cookies, board, widget_inputs):
+        captured["headers"] = [w.get("header") for w in widget_inputs]
+        captured["uuids"] = {w.get("header"): w.get("widgetUuid") for w in widget_inputs}
+    monkeypatch.setattr(cabinet_edit, "set_widgets", fake_set_widgets)
+
+    plans = await correct_cabinet(
+        "https://host", None, {}, "https://host/docs/?nd=1&infoboard=R0",
+        [{"question": "Тестовый вопрос про процедуры", "answers": ["Оставить А", "Удалить Б"]}],
+        qmap=QMAP, reg="465302", store=store,
+    )
+
+    assert plans[0].restore_headers == ["Виджет Б"]
+    assert "Виджет Б" in captured["headers"]          # вернули
+    assert "Виджет В" not in captured["headers"]      # остался удалённым
+    assert captured["uuids"]["Виджет Б"] == ""        # новый виджет: uuid присвоит каталог
+    assert captured["uuids"]["Виджет А"] == "u-Виджет А"  # существующий сохранил свой uuid
+
+
+@pytest.mark.asyncio
+async def test_restore_keeps_widget_added_after_snapshot(monkeypatch):
+    """Виджет, добавленный в кабинет вручную после снимка, не теряется при уточнении."""
+    tree = dict(PRUNED_TREE)
+    tree["R3"] = BoardConfig(
+        "R3", "a", "Целевой под-кабинет", None,
+        [_w("Виджет А"), _w("Добавлен вручную"), _back()],
+    )
+    _patch_tree(monkeypatch, tree)
+    store = StubSnapshotStore()
+    store.data[("465302", "R3")] = {
+        "id": "R3", "author": "a", "title": "Целевой под-кабинет",
+        "searchString": None, "hiddenOnStartPage": None,
+        "widgets": [w for w in TARGET_WIDGETS],
+    }
+    captured = {}
+
+    async def fake_set_widgets(base_url, client, cookies, board, widget_inputs):
+        captured["headers"] = [w.get("header") for w in widget_inputs]
+    monkeypatch.setattr(cabinet_edit, "set_widgets", fake_set_widgets)
+
+    await correct_cabinet(
+        "https://host", None, {}, "https://host/docs/?nd=1&infoboard=R0",
+        [{"question": "Тестовый вопрос про процедуры", "answers": ["Оставить А", "Удалить Б"]}],
+        qmap=QMAP, reg="465302", store=store,
+    )
+
+    assert "Добавлен вручную" in captured["headers"]
+
+
+@pytest.mark.asyncio
+async def test_set_widgets_preserves_hidden_on_start_page(monkeypatch):
+    """editConfig — полная замена конфига: флаг скрытия с главной ТЭ должен уходить обратно."""
+    captured = {}
+
+    async def fake_graphql(base_url, client, cookies, query, variables):
+        captured["input"] = variables["ConfigInput"]
+        return {}
+    monkeypatch.setattr(cabinet_edit, "_graphql", fake_graphql)
+
+    board = BoardConfig("R3", "kodeks", "Целевой", None, [], hidden_on_start_page=True)
+    await cabinet_edit.set_widgets("https://host", None, {}, board, [])
+
+    assert captured["input"]["hiddenOnStartPage"] is True

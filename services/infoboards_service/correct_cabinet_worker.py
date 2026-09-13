@@ -2,9 +2,10 @@
 Kafka worker для топика correct_cabinet (уточнение кабинета по опроснику).
 
 Поток: payload (userId, reg, link, questions[]) -> base_url по reg (reg_services) + админ-cookies
-(AuthService) -> correct_cabinet(): обойти дерево кабинетов от link ВГЛУБЬ, в целевых под-кабинетах
-(на любом уровне) удалить виджеты невыбранных вариантов (по справочнику) -> ответ в топик
-cabinet-corrected (userId, reg, oldLink, link).
+(AuthService) -> correct_cabinet(): обойти дерево кабинетов от link ВГЛУБЬ, снять эталон каждого
+борда в cabinet_snapshots (один раз), в целевых под-кабинетах (на любом уровне) привести состав
+виджетов к ответам опросника — удалить невыбранные и ВЕРНУТЬ выбранные, удалённые прошлым
+проходом -> ответ в топик cabinet-corrected (userId, reg, oldLink, link).
 
 Ошибки валидации / REG_NOT_FOUND -> DLQ без retry. NetworkError/прочие AuthError -> retry с backoff, затем DLQ.
 Используется единым воркером (unified_worker) или как отдельный процесс (run_worker).
@@ -30,6 +31,7 @@ from common.logger import get_logger, set_trace_id
 from services.auth_service.service import AuthService
 from services.infoboards_service.cabinet_edit import correct_cabinet, load_questionnaire_map
 from services.infoboards_service.dto import CorrectCabinetDTO
+from services.infoboards_service.snapshot_store import CabinetSnapshotStore
 from services.users_service.reg_resolver import RegResolver
 
 
@@ -88,6 +90,9 @@ async def _handle_with_retries(
                 base_url, http_client, cookies, dto.link,
                 [q.model_dump() for q in dto.questions],
                 dry_run=dry_run,
+                reg=dto.reg,
+                store=CabinetSnapshotStore(settings),
+                restore=bool(getattr(settings, "CORRECT_CABINET_RESTORE", True)),
             )
             if dry_run:
                 logger.warning("CORRECT_CABINET_DRY_RUN=true — виджеты НЕ удалялись (только план)")
@@ -99,7 +104,8 @@ async def _handle_with_retries(
             })
             logger.info(
                 "correct_cabinet done reg=%r plans=%s",
-                dto.reg, [(p.action, p.sub_id, len(p.delete_headers)) for p in plans],
+                dto.reg,
+                [(p.action, p.sub_id, len(p.delete_headers), len(p.restore_headers)) for p in plans],
             )
             return
         except (ParseError, ValueError) as e:

@@ -16,6 +16,11 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from common.exceptions import ConfigError
 
 
+# Суффикс группы-дубля для главного пользователя. Вынесен константой, чтобы сервисы
+# могли брать значение по умолчанию, не создавая Settings (важно для тестов).
+DEFAULT_ADMIN_GROUP_SUFFIX = "-админ"
+
+
 class Settings(BaseSettings):
     """
     Настройки сервиса. Загружаются из .env при создании экземпляра.
@@ -41,6 +46,10 @@ class Settings(BaseSettings):
     DB_TABLE_DEPARTMENT_MAPPING: str = Field(
         "department_service_mapping",
         description="Таблица маппинга отделов/кабинетов, env: DB_TABLE_DEPARTMENT_MAPPING",
+    )
+    DB_TABLE_CABINET_SNAPSHOTS: str = Field(
+        "cabinet_snapshots",
+        description="Таблица снимков исходной конфигурации кабинетов, env: DB_TABLE_CABINET_SNAPSHOTS",
     )
 
     # --- Учётные данные каталога (используются в auth_service при логине) ---
@@ -126,6 +135,19 @@ class Settings(BaseSettings):
         False,
         description="Если true — correct_cabinet только логирует план (без удаления виджетов). Для безопасного первого прогона.",
     )
+    CORRECT_CABINET_RESTORE: bool = Field(
+        True,
+        description=(
+            "Считать уточнение от снимка кабинета (cabinet_snapshots): повторный опросник возвращает "
+            "ранее удалённые виджеты. False — прежнее поведение: только удаление от текущего состояния."
+        ),
+    )
+
+    # --- Группа-дубль для главного пользователя (пункт «пользователь ↔ кабинет не через отделы») ---
+    ADMIN_GROUP_SUFFIX: str = Field(
+        DEFAULT_ADMIN_GROUP_SUFFIX,
+        description="Суффикс группы-дубля для главного пользователя отдела, напр. 'Эколог' -> 'Эколог-админ'",
+    )
 
     # --- Reg company (enable/disable) Kafka worker — пока только приём и лог ---
     KAFKA_ENABLE_REG_COMPANY_TOPIC: str = Field(
@@ -183,6 +205,7 @@ class Settings(BaseSettings):
         for name, val in (
             ("DB_TABLE_REG_SERVICES", self.DB_TABLE_REG_SERVICES),
             ("DB_TABLE_DEPARTMENT_MAPPING", self.DB_TABLE_DEPARTMENT_MAPPING),
+            ("DB_TABLE_CABINET_SNAPSHOTS", self.DB_TABLE_CABINET_SNAPSHOTS),
         ):
             if not safe.match(val):
                 raise ValueError(f"{name} must be a valid table name (letters, digits, underscore): {val!r}")

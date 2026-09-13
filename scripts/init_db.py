@@ -48,6 +48,7 @@ async def _run() -> None:
 
     tbl_reg = settings.DB_TABLE_REG_SERVICES
     tbl_dsm = settings.DB_TABLE_DEPARTMENT_MAPPING
+    tbl_snap = settings.DB_TABLE_CABINET_SNAPSHOTS
 
     migrations_dir = Path(__file__).parent / "migrations"
     migrations = sorted(migrations_dir.glob("*.sql"))
@@ -56,11 +57,15 @@ async def _run() -> None:
 
     engine = create_async_engine(db_url, pool_size=1, pool_pre_ping=True)
 
-    print(f"Подключение к БД (таблицы: {tbl_reg!r}, {tbl_dsm!r})...")
+    print(f"Подключение к БД (таблицы: {tbl_reg!r}, {tbl_dsm!r}, {tbl_snap!r})...")
     async with engine.begin() as conn:
         for m in migrations:
             sql = m.read_text(encoding="utf-8")
-            sql = sql.replace("reg_services", tbl_reg).replace("department_service_mapping", tbl_dsm)
+            sql = (
+                sql.replace("reg_services", tbl_reg)
+                .replace("department_service_mapping", tbl_dsm)
+                .replace("cabinet_snapshots", tbl_snap)
+            )
             print(f"  Выполняю {m.name}...")
             await conn.execute(text(sql))
 
