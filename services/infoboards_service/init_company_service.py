@@ -33,10 +33,28 @@ from services.infoboards_service.cabinet_acl import (
 )
 from services.infoboards_service.dto import InitCompanyDTO
 from services.users_service.catalog_client import CatalogClient
-from services.users_service.html_parser import parse_groups_catalog
+from services.users_service.html_parser import parse_groups_catalog, parse_user_state
 
 
 logger = get_logger("infoboards.init_company")
+
+# Текстовые поля формы пользователя каталога (кроме uid, psw, id, grp): при сохранении
+# каталог ждёт их все, иначе трактует отсутствие как очистку.
+_USER_FORM_FIELDS = ("name", "org", "pos", "mail", "telephon", "end")
+
+
+def _normalize_group_title(value: str) -> str:
+    """Нормализация названия группы для сравнения: пробелы схлопнуты, регистр нижний."""
+    return " ".join(value.strip().casefold().split())
+
+
+def _find_group_id(groups: dict[str, int], title: str) -> int | None:
+    """Найти id группы по названию без учёта регистра и лишних пробелов."""
+    wanted = _normalize_group_title(title)
+    for name, gid in groups.items():
+        if _normalize_group_title(name) == wanted:
+            return gid
+    return None
 
 
 @dataclass
@@ -91,6 +109,9 @@ class InitCompanyService:
         # Шаг 4: синхронизация групп в сервисе
         groups_dict = await self._sync_groups(base_url, cookies, reg)
         logger.debug("_sync_groups -> groups_count=%s keys_sample=%s", len(groups_dict), list(groups_dict.keys())[:15])
+
+        # Шаг 4.3: группы-дубли главных пользователей (см. _sync_admin_groups)
+        groups_dict = await self._sync_admin_groups(base_url, cookies, dto, groups_dict)
 
         # Шаг 5.1: получение кабинетов
         boards_dict = await self._get_boards(base_url, cookies)
@@ -220,6 +241,81 @@ class InitCompanyService:
                 groups = parse_groups_catalog(html)
 
         return groups
+
+    async def _sync_admin_groups(
+        self,
+        base_url: str,
+        cookies: dict[str, str],
+        dto: InitCompanyDTO,
+        groups: dict[str, int],
+    ) -> dict[str, int]:
+        """
+        4.3: для отделов с mainUser — группа-дубль «{title}{ADMIN_GROUP_SUFFIX}» и выдача её пользователю.
+
+        Группа-дубль намеренно НЕ попадает в department_service_mapping: она задаёт связь
+        «пользователь -> кабинет» в обход отделов и потому не пересобирается при следующем
+        sync_departments (см. защиту в users_service.handle_update_departments).
+        ACL кабинета для неё пока такой же, как у обычной группы: разведение прав
+        «просмотр / редактирование» — отдельная задача, см. docs/BACKLOG.md.
+
+        Возвращает актуальный словарь групп каталога (после возможных созданий).
+        """
+        suffix = getattr(self.settings, "ADMIN_GROUP_SUFFIX", "-админ")
+        targets = [
+            (d.title.strip(), (d.mainUser or "").strip())
+            for d in dto.departments
+            if (d.mainUser or "").strip() and d.title.strip()
+        ]
+        if not targets:
+            return groups
+
+        logger.debug("_sync_admin_groups targets=%s suffix=%r", targets, suffix)
+        for title, uid in targets:
+            admin_title = f"{title}{suffix}"
+            group_id = _find_group_id(groups, admin_title)
+            if group_id is None:
+                logger.info("создаю группу-дубль %r для главного пользователя %r", admin_title, uid)
+                await self.catalog_client.create_group(base_url, admin_title, cookies)
+                groups = parse_groups_catalog(
+                    await self.catalog_client.get_groups_page(base_url, cookies)
+                )
+                group_id = _find_group_id(groups, admin_title)
+            if group_id is None:
+                logger.warning("группа-дубль %r не найдена после создания — пропуск", admin_title)
+                continue
+            await self._assign_group_to_user(base_url, cookies, uid, group_id)
+        return groups
+
+    async def _assign_group_to_user(
+        self,
+        base_url: str,
+        cookies: dict[str, str],
+        uid: str,
+        group_id: int,
+    ) -> None:
+        """Добавить группу пользователю, сохранив уже имеющиеся (форма каталога ждёт все поля целиком)."""
+        page = await self.catalog_client.get_user_page(base_url, uid, cookies)
+        if page is None:
+            logger.warning("главный пользователь %r не найден в каталоге — группа %s не выдана", uid, group_id)
+            return
+        state = parse_user_state(page)
+        if group_id in state.groups:
+            logger.debug("у пользователя %r группа %s уже есть — пропуск", uid, group_id)
+            return
+
+        form_data: list[tuple[str, str]] = [
+            ("uid", state.fields.get("uid", uid)),
+            ("psw", state.fields.get("psw", "")),
+            ("id", state.fields.get("id", uid)),
+        ]
+        for key in _USER_FORM_FIELDS:
+            form_data.append((key, state.fields.get(key, "")))
+        for grp in sorted(set(state.groups) | {group_id}):
+            form_data.append(("grp", str(grp)))
+        form_data.append(("set", ""))
+
+        await self.catalog_client.post_user(base_url, form_data, cookies)
+        logger.info("пользователю %r выдана группа-дубль id=%s", uid, group_id)
 
     async def _get_boards(self, base_url: str, cookies: dict[str, str]) -> dict[str, str]:
         """5.1: GraphQL board.many -> title -> id (через cabinet_acl.get_boards)."""

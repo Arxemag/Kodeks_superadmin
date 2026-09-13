@@ -50,10 +50,14 @@ class DepartmentPayload(BaseModel):
     title — название группы (например TEST);
     modules — названия кабинетов.
     id обязателен (UUID) для каждого отдела.
+    mainUser — uid главного пользователя отдела в каталоге (опционально): ему выдаётся
+    группа-дубль «{title}{ADMIN_GROUP_SUFFIX}», не привязанная к отделам. Поле необязательное,
+    без него поведение прежнее.
     """
     id: UUID
     title: str  # Название группы
     modules: list[str] = Field(default_factory=list)  # Названия кабинетов
+    mainUser: str | None = None  # uid главного пользователя (группа-дубль на редактирование)
 
 
 class InitCompanyDTO(BaseModel):

@@ -206,6 +206,7 @@ async def run_unified_worker() -> None:
             auth_client=auth_client,
             catalog_client=catalog_client,
             reg_resolver=resolver,
+            admin_group_suffix=settings.ADMIN_GROUP_SUFFIX,
         )
 
         await producer.start()

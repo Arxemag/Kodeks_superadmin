@@ -92,3 +92,79 @@ async def test_handle_update_departments_creates_group_and_assigns(
         })
     )
     assert stub_catalog_client.users["User1"].get("grp") == [7]
+
+
+# --- Группы-дубли главного пользователя не затираются обновлением отделов -------------
+
+
+@pytest.mark.asyncio
+async def test_admin_group_survives_department_update(
+    user_service: UserService,
+    stub_catalog_client: StubCatalogClient,
+) -> None:
+    """«Эколог-админ» выдана вне отделов и в payload не приходит — после смены отделов она остаётся."""
+    stub_catalog_client._groups_map = {"Эколог": 7, "Эколог-админ": 8, "Новый отдел": 9}
+    await user_service.handle_create(
+        CreateUserDTO.model_validate({"reg": "350832", "uid": "Boss", "psw": "123", "grp": [7, 8]})
+    )
+
+    await user_service.handle_update_departments(
+        UpdateUserDepartmentsDTO.model_validate({
+            "reg": "350832",
+            "id": "Boss",
+            "departments": [{"id": "d2", "title": "Новый отдел"}],
+        })
+    )
+
+    assert stub_catalog_client.users["Boss"].get("grp") == [8, 9]
+
+
+@pytest.mark.asyncio
+async def test_department_group_still_replaced(
+    user_service: UserService,
+    stub_catalog_client: StubCatalogClient,
+) -> None:
+    """Обычные группы отделов по-прежнему заменяются целиком — защита не должна их удерживать."""
+    stub_catalog_client._groups_map = {"Эколог": 7, "Новый отдел": 9}
+    await user_service.handle_create(
+        CreateUserDTO.model_validate({"reg": "350832", "uid": "Ivan", "psw": "123", "grp": [7]})
+    )
+
+    await user_service.handle_update_departments(
+        UpdateUserDepartmentsDTO.model_validate({
+            "reg": "350832",
+            "id": "Ivan",
+            "departments": [{"id": "d2", "title": "Новый отдел"}],
+        })
+    )
+
+    assert stub_catalog_client.users["Ivan"].get("grp") == [9]
+
+
+@pytest.mark.asyncio
+async def test_empty_suffix_disables_preservation(
+    stub_auth_client,
+    stub_catalog_client: StubCatalogClient,
+    stub_reg_resolver,
+) -> None:
+    """Пустой суффикс отключает механизм: иначе под правило попали бы все группы подряд."""
+    service = UserService(
+        auth_client=stub_auth_client,
+        catalog_client=stub_catalog_client,
+        reg_resolver=stub_reg_resolver,
+        admin_group_suffix="",
+    )
+    stub_catalog_client._groups_map = {"Эколог-админ": 8, "Новый отдел": 9}
+    await service.handle_create(
+        CreateUserDTO.model_validate({"reg": "350832", "uid": "Zero", "psw": "123", "grp": [8]})
+    )
+
+    await service.handle_update_departments(
+        UpdateUserDepartmentsDTO.model_validate({
+            "reg": "350832",
+            "id": "Zero",
+            "departments": [{"id": "d2", "title": "Новый отдел"}],
+        })
+    )
+
+    assert stub_catalog_client.users["Zero"].get("grp") == [9]

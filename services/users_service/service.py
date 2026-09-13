@@ -12,6 +12,7 @@ import asyncio
 from dataclasses import dataclass
 from typing import Any
 
+from common.config import DEFAULT_ADMIN_GROUP_SUFFIX
 from common.exceptions import ParseError
 from common.logger import get_logger
 from services.users_service.auth_client import AuthClient
@@ -39,6 +40,8 @@ class UserService:
     auth_client: AuthClient
     catalog_client: CatalogClient
     reg_resolver: RegResolver
+    # Суффикс групп, выданных вне отделов: такие группы не затираются обновлением отделов.
+    admin_group_suffix: str = DEFAULT_ADMIN_GROUP_SUFFIX
 
     async def handle_create(self, payload: CreateUserDTO) -> None:
         """Создание пользователя: base_url и куки, проверка существования по get_user_page; при наличии — переход в _update_from_state, иначе POST с обязательными и опциональными полями."""
@@ -137,6 +140,15 @@ class UserService:
             raise ParseError(code="USER_NOT_FOUND", message=f"user '{payload.id}' not found for department update")
 
         existing = parse_user_state(user_page)
+
+        # Группы-дубли («Эколог-админ») выдаются вне отделов и в payload не приходят.
+        # Без этого они были бы затёрты первым же обновлением отделов, и доступ молча пропал бы.
+        preserved = _preserved_admin_groups(groups_map, existing.groups, self.admin_group_suffix)
+        if preserved:
+            logger.info(
+                f"сохраняю группы вне отделов uid={payload.id!r} groups={sorted(preserved)}"
+            )
+            target_group_ids = target_group_ids + [g for g in preserved if g not in target_group_ids]
 
         if sorted(set(existing.groups)) == sorted(set(target_group_ids)):
             logger.info(f"skip department update (no changes) uid={payload.id!r}")
@@ -283,6 +295,27 @@ def _to_form_value(value: Any) -> str:
 def _normalize_title(value: str) -> str:
     """Нормализация названия для сравнения: пробелы схлопнуты, нижний регистр."""
     return " ".join(value.strip().casefold().split())
+
+
+def _preserved_admin_groups(
+    groups_map: dict[str, int],
+    current_groups: list[int],
+    suffix: str,
+) -> set[int]:
+    """
+    Из текущих групп пользователя выбрать те, что выданы вне отделов — группы-дубли
+    с суффиксом ADMIN_GROUP_SUFFIX (напр. «Эколог-админ»). Они не приходят в payload
+    update-user-departments, поэтому при замене списка групп их нужно сохранить.
+    Пустой суффикс отключает механизм (иначе под правило попали бы все группы).
+    """
+    suffix = _normalize_title(suffix)
+    if not suffix:
+        return set()
+    admin_ids = {
+        gid for title, gid in groups_map.items()
+        if _normalize_title(title).endswith(suffix)
+    }
+    return {g for g in current_groups if g in admin_ids}
 
 
 def _safe_form_data(form_data: list[tuple[str, str]]) -> list[tuple[str, str]]:
