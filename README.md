@@ -196,6 +196,13 @@ pytest tests -v
 
 Подробное описание модулей, функций и их взаимодействия — в **[docs/DOCUMENTATION.md](docs/DOCUMENTATION.md)**. Там описаны: архитектура и потоки данных, точки входа, модуль `common` (config, db, kafka, http, logger, exceptions), сервисы auth, users, infoboards, reg_company, единый воркер, скрипты и сводная таблица взаимодействий. Нужно для сдачи проекта и онбординга.
 
+## Доработки и бэклог
+
+- **[docs/CABINET_SNAPSHOTS_AND_ADMIN_GROUPS.md](docs/CABINET_SNAPSHOTS_AND_ADMIN_GROUPS.md)** — снимки кабинетов
+  (повторное уточнение с возвратом виджетов) и группы-дубли для главного пользователя.
+- **[docs/BACKLOG.md](docs/BACKLOG.md)** — разобранное, но отложенное: права просмотр/редактирование,
+  замена рега, стартовые ЦК на главной ТЭ, техдолг.
+
 ## БД
 
 Требуется **PostgreSQL**. Схему создаёт `scripts/init_db.py` (читает SQL из `scripts/migrations/` по порядку). Имена таблиц задаются через ENV: `DB_TABLE_REG_SERVICES` (по умолчанию `reg_services`), `DB_TABLE_DEPARTMENT_MAPPING` (по умолчанию `department_service_mapping`) — для подстройки под разные схемы БД.
@@ -224,6 +231,21 @@ pytest tests -v
 | `mapping_status`   | `mapping_status_enum`   | NOT NULL, default `'active'` | `active` или `archived` |
 
 Индексы: по `reg`; уникальный по паре `(reg, department_id)`.
+
+**3. `cabinet_snapshots`** (или значение `DB_TABLE_CABINET_SNAPSHOTS`) — эталонные снимки конфигурации
+кабинетов до первого уточнения по опроснику.
+
+| Колонка      | Тип            | Ограничения            | Описание                                   |
+|--------------|----------------|------------------------|--------------------------------------------|
+| `id`         | `bigint`       | PRIMARY KEY, serial    | Суррогатный ключ                           |
+| `reg`        | `varchar(50)`  | NOT NULL               | Код рега                                   |
+| `board_id`   | `varchar(100)` | NOT NULL               | Идентификатор борда (напр. `P000M`)        |
+| `title`      | `text`         | NOT NULL, default `''` | Заголовок кабинета на момент снимка        |
+| `config`     | `jsonb`        | NOT NULL               | Полный конфиг борда, включая виджеты       |
+| `created_at` | `timestamptz`  | NOT NULL, default now()| Когда снят                                 |
+
+Уникальный индекс по паре `(reg, board_id)`: эталон пишется один раз и не перезаписывается.
+Подробности — в [docs/CABINET_SNAPSHOTS_AND_ADMIN_GROUPS.md](docs/CABINET_SNAPSHOTS_AND_ADMIN_GROUPS.md).
 
 ### Создание схемы перед первым запуском
 
