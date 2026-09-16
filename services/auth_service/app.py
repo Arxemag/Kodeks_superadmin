@@ -138,12 +138,18 @@ def create_app() -> FastAPI:
     async def get_infoboard_link(
         reg: str,
         title: str | None = None,
+        include_hidden: bool = False,
         db: AsyncSession = Depends(get_db),
         settings: Settings = Depends(get_settings),
     ):
-        """Ссылка на инфоборд: по reg берётся base_url, выполняется GraphQL к каталогу; при title — один кабинет, без title — список. Обработка в InfoboardsService."""
+        """
+        Ссылка на инфоборд: по reg берётся base_url, выполняется GraphQL к каталогу;
+        при title — один кабинет, без title — список кабинетов стартовой страницы ТЭ.
+        include_hidden=true отдаёт список целиком, включая под-кабинеты каскада.
+        Обработка в InfoboardsService.
+        """
         service = InfoboardsService(db=db, settings=settings)
-        data = await service.get_link_by_reg_and_title(reg=reg, title=title)
+        data = await service.get_link_by_reg_and_title(reg=reg, title=title, include_hidden=include_hidden)
         if "items" in data:
             return InfoboardsListResponse(**data)
         return InfoboardLinkResponse(**data)

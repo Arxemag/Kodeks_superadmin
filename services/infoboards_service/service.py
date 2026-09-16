@@ -46,8 +46,23 @@ class InfoboardsService:
     db: AsyncSession
     settings: Settings
 
-    async def get_link_by_reg_and_title(self, reg: str, title: str | None) -> dict[str, Any]:
-        """По reg — base_url и куки админа; GraphQL запрос к каталогу; разбор many; при title — один элемент с совпадающим title, иначе {"items": [...]}."""
+    async def get_link_by_reg_and_title(
+        self,
+        reg: str,
+        title: str | None,
+        *,
+        include_hidden: bool = False,
+    ) -> dict[str, Any]:
+        """
+        По reg — base_url и куки админа; GraphQL запрос к каталогу; разбор many;
+        при title — один элемент с совпадающим title, иначе {"items": [...]}.
+
+        В списке остаются только кабинеты, видимые на стартовой странице ТЭ
+        (hiddenOnStartPage != true) — под-кабинеты каскада на главной не перечисляются.
+        include_hidden=True возвращает список целиком, как раньше.
+        Поиск по title идёт по ВСЕМ кабинетам, включая скрытые: ссылка на под-кабинет
+        каскада нужна и тогда, когда плитки на главной у него нет.
+        """
         base_url = await self._get_base_url(reg)
         api_url = f"{base_url.rstrip('/')}/infoboard/graphql?context=docs"
         payload = {"query": _GRAPHQL_QUERY, "variables": None}
@@ -95,7 +110,9 @@ class InfoboardsService:
         if not isinstance(many, list):
             raise ParseError(code="INFOBOARDS_PARSE_ERROR", message="Invalid infoboards payload structure")
 
-        items: list[dict[str, str]] = []
+        # Разбираем вместе с флагом видимости: он нужен для списка, но не для поиска по title.
+        # Отсутствующий/None hiddenOnStartPage считаем «видимым» — не прячем то, в чём не уверены.
+        parsed: list[tuple[dict[str, str], bool]] = []
         for item in many:
             if not isinstance(item, dict):
                 continue
@@ -104,16 +121,30 @@ class InfoboardsService:
             if not board_id or not board_title:
                 continue
             link = f"{base_url.rstrip('/')}/docs/?nd=606025000&infoboard={board_id}"
-            items.append({"id": board_id, "title": board_title, "link": link})
+            entry = {"id": board_id, "title": board_title, "link": link}
+            parsed.append((entry, bool(item.get("hiddenOnStartPage"))))
 
-        if not items:
+        if not parsed:
             raise ParseError(code="INFOBOARDS_PARSE_ERROR", message="No valid infoboards found in payload")
 
         if title is None or not title.strip():
-            return {"items": items}
+            if include_hidden:
+                return {"items": [entry for entry, _ in parsed]}
+            visible = [entry for entry, hidden in parsed if not hidden]
+            logger.info(
+                f"infoboards list reg={reg!r} всего={len(parsed)} на стартовой={len(visible)}"
+            )
+            if not visible:
+                # Скрыты все до одного — это аномалия каталога, а не нормальный ответ.
+                # Отдаём пустой список и говорим об этом в лог, вместо тихой выдачи всего подряд.
+                logger.warning(
+                    f"infoboards list reg={reg!r}: на стартовой нет ни одного кабинета из {len(parsed)}; "
+                    f"полный список — include_hidden=true"
+                )
+            return {"items": visible}
 
         wanted = _normalize_title(title)
-        for entry in items:
+        for entry, _hidden in parsed:
             if _normalize_title(entry["title"]) == wanted:
                 return entry
         raise ParseError(code="INFOBOARD_NOT_FOUND", message=f"Infoboard with title {title!r} not found")

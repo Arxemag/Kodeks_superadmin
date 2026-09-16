@@ -114,7 +114,7 @@ python main_unified_worker.py
 
 **Auth API** (`main.py`)  
 - `POST /api/expert/reg/{reg}` — cookies каталога по reg. Опционально query-параметр `name`: без `name` — куки админа, с `name` — куки пользователя (пароль запрашивается через админа). Пример: `POST /api/expert/reg/350832` или `POST /api/expert/reg/350832?name=user1`  
-- `GET /api/expert/infoboards/link?reg=...&title=...` — ссылка на кабинет (или список кабинетов без `title`)  
+- `GET /api/expert/infoboards/link?reg=...&title=...` — ссылка на кабинет. Без `title` — список кабинетов **стартовой страницы ТЭ** (под-кабинеты каскада не перечисляются). Поиск по `title` находит любой кабинет, включая скрытые. `&include_hidden=true` — полный список, как раньше  
 - `GET /api/expert/health`, `GET /api/expert/metrics`
 
 **Единый Kafka worker** (`main_unified_worker.py`) — одна consumer group, все топики:
