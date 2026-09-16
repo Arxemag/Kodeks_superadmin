@@ -190,34 +190,36 @@ class AuthService:
             if page.status_code != 200:
                 raise NetworkError(code="USER_PAGE_ERROR", message="User page not available", http_status=502)
 
-            # Парсим страницу пользователя, чтобы извлечь пароль
-            logger.debug(f"Получена страница пользователя: {page.text[:500]}...")
+            # Парсим страницу пользователя, чтобы извлечь пароль.
+            # ВАЖНО: на этой странице пароль лежит в value поля psw, поэтому ни сам HTML,
+            # ни найденный тег, ни значение в лог не пишем — ни на каком уровне.
+            # Для диагностики достаточно размеров и имён полей.
+            logger.debug("страница пользователя получена: %s символов", len(page.text))
 
             # Ищем поле пароля с именем "psw"
             tag_match = _PSW_INPUT_TAG_RE.search(page.text)
             if not tag_match:
-                # Ищем все input поля для отладки
-                all_inputs = re.findall(r'<input[^>]*>', page.text)
-                logger.debug(f"Все input поля: {all_inputs}")
+                # Для отладки — только ИМЕНА полей формы, без значений.
+                names = re.findall(r'<input[^>]*\bname\s*=\s*["\']([^"\']+)["\']', page.text, re.I)
+                logger.debug("поле psw не найдено; имена полей формы: %s", sorted(set(names)))
                 raise ParseError(code="USER_PASSWORD_NOT_FOUND", message="Password field not found")
 
-            logger.debug(f"Найдено поле пароля: {tag_match.group(0)}")
+            logger.debug("поле psw найдено")
 
             # Извлекаем значение из атрибута value
             value_match = _VALUE_ATTR_RE.search(tag_match.group(0))
             if not value_match:
-                logger.debug(f"Не найден атрибут value в поле пароля: {tag_match.group(0)}")
+                logger.debug("у поля psw нет атрибута value")
                 raise ParseError(code="USER_PASSWORD_NOT_FOUND", message="Password value not found")
 
             password = value_match.group(1)
-            logger.debug(f"Извлечённое значение пароля: '{password}'")
+            logger.debug("пароль пользователя извлечён (длина %s)", len(password))
 
             if not password:
                 # Если пароль пустой, пробуем использовать пароль из EVN как fallback
                 logger.warning("Password is empty in user page, using admin password as fallback")
                 password = self.settings.ADMIN_PASSWORD
 
-            logger.debug(f"Используемый пароль для входа: '{password}'")
             return password
         finally:
             await client.aclose()
@@ -259,8 +261,8 @@ class AuthService:
 
             # Извлекаем куки как dict
             cookies = dict(client.cookies)
+            # Значения кук — это сессия пользователя каталога, в лог они не идут.
             logger.debug(f"user login success cookies_keys={list(cookies.keys())}")
-            logger.debug(f"user login success cookies_values={cookies}")
             return cookies
         finally:
             await client.aclose()

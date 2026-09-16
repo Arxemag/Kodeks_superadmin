@@ -1,7 +1,8 @@
 """
 Единый Kafka worker: одна consumer group, подписка на все топики, маршрутизация по record.topic.
 
-Топики: create-user, update-user, update-user-departments, init_company, enable_reg_company, disable_reg_company.
+Топики: create-user, update-user, update-user-departments, init_company, sync_departments,
+enable_reg_company, disable_reg_company, correct-cabinet.
 Один consumer с KAFKA_GROUP_ID, один producer, один OffsetTracker. Обработчики — те же, что в отдельных воркерах.
 """
 from __future__ import annotations
