@@ -17,6 +17,9 @@ Auth API и Kafka-воркеры для каталога Кодекс: поль�
    - **Kafka:** `KAFKA_BOOTSTRAP_SERVERS` (или `KAFKA_BROKER`), например `kafka:9092` или хост:порт брокера.
    - **Одна consumer group:** `KAFKA_GROUP_ID` (по умолчанию `superadmin-workers`).
    - **Учётные данные каталога:** `ADMIN_LOGIN`, `ADMIN_PASSWORD` (обязательные, без них приложение не стартует).
+   - **`ADMIN_API_TOKEN`** — токен на запись в справочник `reg_services` (`POST`/`DELETE` и админка `/admin/reg-services`).
+     Без него **auth-api не стартует**. Чтение (`GET /api/expert/reg-services`) остаётся открытым.
+     Сгенерировать: `python -c "import secrets; print(secrets.token_urlsafe(32))"`
 
 3. **Порты (что слушает приложение):**
 

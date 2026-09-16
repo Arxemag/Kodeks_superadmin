@@ -6,11 +6,17 @@ API:  GET  /api/expert/reg-services      — список
       POST /api/expert/reg-services      — добавить/изменить {reg_number, base_url} (upsert)
       DELETE /api/expert/reg-services/{reg_number} — удалить
 
-Без авторизации — рассчитано на закрытый доступ (VPN/внутренняя сеть). Не публиковать наружу как есть.
+ЗАПИСЬ защищена токеном: POST и DELETE требуют заголовок X-Api-Token, равный ADMIN_API_TOKEN.
+Чтение (GET списка и HTML-страница) открыто — по нему нельзя ничего сломать, а фронт может
+брать оттуда хост кабинета по регу. Запись переписывает соответствие «рег -> каталог» для всей
+системы, а порт 8000 бывает доступен снаружи, поэтому она закрыта.
+Без ADMIN_API_TOKEN в .env Auth API не стартует (проверка в app.lifespan).
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException
+import secrets
+
+from fastapi import APIRouter, Depends, Header, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from sqlalchemy import text
@@ -23,6 +29,24 @@ from common.logger import get_logger
 
 logger = get_logger("auth.reg_admin")
 router = APIRouter()
+
+
+async def require_admin_token(
+    x_api_token: str | None = Header(default=None, alias="X-Api-Token"),
+    settings: Settings = Depends(get_settings),
+) -> None:
+    """
+    Пускает дальше только с верным X-Api-Token. Сравнение через compare_digest,
+    чтобы по времени ответа нельзя было подбирать токен посимвольно.
+    """
+    expected = (getattr(settings, "ADMIN_API_TOKEN", "") or "").strip()
+    if not expected:
+        # Штатно сюда не попасть: пустой токен ловится при старте приложения.
+        logger.error("ADMIN_API_TOKEN пуст — запись в reg_services отклонена")
+        raise HTTPException(status_code=503, detail="ADMIN_API_TOKEN не настроен")
+    if not x_api_token or not secrets.compare_digest(x_api_token, expected):
+        logger.warning("отклонена запись в reg_services: неверный или отсутствующий X-Api-Token")
+        raise HTTPException(status_code=401, detail="Требуется корректный заголовок X-Api-Token")
 
 
 class RegServiceIn(BaseModel):
@@ -41,7 +65,7 @@ async def list_reg_services(
     return [{"reg_number": r[0], "base_url": r[1]} for r in res]
 
 
-@router.post("/api/expert/reg-services")
+@router.post("/api/expert/reg-services", dependencies=[Depends(require_admin_token)])
 async def upsert_reg_service(
     body: RegServiceIn,
     db: AsyncSession = Depends(get_db),
@@ -65,7 +89,7 @@ async def upsert_reg_service(
     return {"reg_number": reg, "base_url": url}
 
 
-@router.delete("/api/expert/reg-services/{reg_number}")
+@router.delete("/api/expert/reg-services/{reg_number}", dependencies=[Depends(require_admin_token)])
 async def delete_reg_service(
     reg_number: str,
     db: AsyncSession = Depends(get_db),
@@ -101,6 +125,9 @@ _HTML = """<!doctype html>
 </style></head>
 <body>
 <h1>reg_services — справочник reg → base_url каталога</h1>
+<div class="add">
+  <input id="token" type="password" placeholder="X-Api-Token (нужен только для сохранения и удаления)">
+</div>
 <div id="msg"></div>
 <div class="add">
   <input id="newReg" class="reg" placeholder="reg (напр. 465302)">
@@ -113,6 +140,11 @@ _HTML = """<!doctype html>
 <script>
 const API="/api/expert/reg-services";
 function msg(t,ok){const m=document.getElementById("msg");m.textContent=t;m.className=ok?"ok":"err";}
+// Токен держим только в пределах вкладки: чтение справочника открыто, он нужен лишь на запись.
+function token(){return (document.getElementById("token").value||"").trim();}
+function authHeaders(extra){const h=Object.assign({},extra||{});const t=token();if(t)h["X-Api-Token"]=t;return h;}
+function saveToken(){try{sessionStorage.setItem("regAdminToken",token());}catch(e){}}
+function restoreToken(){try{const t=sessionStorage.getItem("regAdminToken");if(t)document.getElementById("token").value=t;}catch(e){}}
 async function load(){
   try{const r=await fetch(API);const data=await r.json();
     const tb=document.getElementById("rows");tb.innerHTML="";
@@ -139,19 +171,25 @@ async function addRow(){
   document.getElementById("newReg").value="";document.getElementById("newUrl").value="";
 }
 async function upsert(reg,url){
-  try{const r=await fetch(API,{method:"POST",headers:{"Content-Type":"application/json"},
+  if(!token()){msg("Укажите X-Api-Token — без него запись запрещена",false);return;}
+  try{const r=await fetch(API,{method:"POST",headers:authHeaders({"Content-Type":"application/json"}),
         body:JSON.stringify({reg_number:reg,base_url:url})});
+    if(r.status===401){throw new Error("неверный X-Api-Token");}
     if(!r.ok){throw new Error((await r.json()).detail||r.status);}
+    saveToken();
     msg(`Сохранено: ${reg}`,true);load();
   }catch(e){msg("Ошибка сохранения: "+e,false);}
 }
 async function del(reg){
   if(!confirm("Удалить "+reg+"?"))return;
-  try{const r=await fetch(API+"/"+encodeURIComponent(reg),{method:"DELETE"});
+  if(!token()){msg("Укажите X-Api-Token — без него удаление запрещено",false);return;}
+  try{const r=await fetch(API+"/"+encodeURIComponent(reg),{method:"DELETE",headers:authHeaders()});
+    if(r.status===401){throw new Error("неверный X-Api-Token");}
     if(!r.ok)throw new Error(r.status);
     msg(`Удалено: ${reg}`,true);load();
   }catch(e){msg("Ошибка удаления: "+e,false);}
 }
+restoreToken();
 load();
 </script>
 </body></html>

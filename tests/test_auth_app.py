@@ -27,6 +27,7 @@ def mock_settings() -> Settings:
         DB_TABLE_DEPARTMENT_MAPPING="department_service_mapping",
         ADMIN_LOGIN="admin",
         ADMIN_PASSWORD="secret",
+        ADMIN_API_TOKEN="test-token",
         HTTP_TIMEOUT=10.0,
         LOG_LEVEL="INFO",
         PORT=8000,
@@ -124,3 +125,80 @@ def test_login_reg_not_found(auth_client: TestClient) -> None:
     data = r.json()
     assert data.get("code") == "REG_NOT_FOUND"
     assert data.get("status") == "error"
+
+
+# --- Запись в reg_services закрыта токеном, чтение открыто ------------------------------
+
+
+TOKEN = "test-token"
+
+
+def test_reg_services_read_is_open(auth_client: TestClient) -> None:
+    """Чтение справочника не требует токена: по нему ничего не сломать."""
+    from common.db import get_db
+
+    session = MagicMock(spec=AsyncSession)
+    session.execute = AsyncMock(return_value=iter([]))
+    auth_client.app.dependency_overrides[get_db] = lambda: session
+    r = auth_client.get("/api/expert/reg-services")
+    assert r.status_code == 200
+    assert r.json() == []
+
+
+def test_reg_services_admin_page_is_open(auth_client: TestClient) -> None:
+    """HTML-админка открывается без токена — писать без него всё равно нельзя."""
+    r = auth_client.get("/admin/reg-services")
+    assert r.status_code == 200
+    assert "X-Api-Token" in r.text
+
+
+def test_upsert_without_token_rejected(auth_client: TestClient) -> None:
+    """Главное: переписать «рег → каталог» без токена нельзя."""
+    r = auth_client.post(
+        "/api/expert/reg-services",
+        json={"reg_number": "465302", "base_url": "https://evil.example"},
+    )
+    assert r.status_code == 401
+
+
+def test_upsert_with_wrong_token_rejected(auth_client: TestClient) -> None:
+    r = auth_client.post(
+        "/api/expert/reg-services",
+        json={"reg_number": "465302", "base_url": "https://evil.example"},
+        headers={"X-Api-Token": "wrong-token"},
+    )
+    assert r.status_code == 401
+
+
+def test_delete_without_token_rejected(auth_client: TestClient) -> None:
+    r = auth_client.delete("/api/expert/reg-services/465302")
+    assert r.status_code == 401
+
+
+def test_upsert_with_valid_token_passes_auth(auth_client: TestClient) -> None:
+    """С верным токеном запрос проходит авторизацию (до слоя БД)."""
+    r = auth_client.post(
+        "/api/expert/reg-services",
+        json={"reg_number": "465302", "base_url": "https://cabinet-03.kodeks.expert"},
+        headers={"X-Api-Token": TOKEN},
+    )
+    assert r.status_code != 401
+
+
+def test_startup_fails_without_admin_api_token(mock_settings: Settings, mock_db_session: MagicMock) -> None:
+    """Без ADMIN_API_TOKEN приложение не поднимается: лучше не стартовать, чем стартовать открытым."""
+    from common.exceptions import ConfigError
+
+    no_token = mock_settings.model_copy(update={"ADMIN_API_TOKEN": ""})
+    get_settings.cache_clear()
+    with (
+        patch("services.auth_service.app.get_settings", return_value=no_token),
+        patch("services.auth_service.app.healthcheck_db", new_callable=AsyncMock),
+        patch("common.db.shutdown_db", new_callable=AsyncMock),
+        patch("common.http.shutdown_http", new_callable=AsyncMock),
+    ):
+        app = create_app()
+        app.dependency_overrides[get_settings] = lambda: no_token
+        with pytest.raises(ConfigError, match="ADMIN_API_TOKEN"):
+            with TestClient(app):
+                pass

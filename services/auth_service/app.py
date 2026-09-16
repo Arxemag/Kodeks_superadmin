@@ -20,7 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from common import COMMON_VERSION
 from common.config import Settings, get_settings
 from common.db import get_db, healthcheck_db, shutdown_db
-from common.exceptions import ServiceError
+from common.exceptions import ConfigError, ServiceError
 from common.http import shutdown_http
 from common.logger import get_logger, get_trace_id, set_trace_id
 from services.auth_service import reg_admin
@@ -44,7 +44,16 @@ async def lifespan(app: FastAPI):
     Жизненный цикл приложения: при старте проверяем конфиг (get_settings) и пишем лог,
     при завершении — закрываем HTTP-транспорт и пул БД.
     """
-    _ = get_settings()
+    settings = get_settings()
+    # Fail-fast: без токена запись в reg_services осталась бы открытой, а порт 8000
+    # бывает доступен снаружи. Лучше не подняться, чем подняться незащищённым.
+    if not (getattr(settings, "ADMIN_API_TOKEN", "") or "").strip():
+        raise ConfigError(
+            message=(
+                "ADMIN_API_TOKEN не задан — запись в reg_services была бы доступна без авторизации. "
+                "Задайте ADMIN_API_TOKEN в .env (см. .env.example) и перезапустите auth-api."
+            )
+        )
     logger.info(f"service started (common={COMMON_VERSION})")
     yield
     await shutdown_http()

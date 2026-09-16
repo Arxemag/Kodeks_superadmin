@@ -56,6 +56,14 @@ class Settings(BaseSettings):
     ADMIN_LOGIN: str = Field(..., description="Catalog admin login")
     ADMIN_PASSWORD: str = Field(..., description="Catalog admin password")
 
+    # Токен на запись в справочник reg_services (POST/DELETE и админка).
+    # Без него Auth API не стартует: порт 8000 бывает открыт наружу, а запись в этот
+    # справочник переписывает соответствие «рег -> каталог» для всей системы.
+    ADMIN_API_TOKEN: str = Field(
+        "",
+        description="Токен для записи в reg_services (заголовок X-Api-Token), env: ADMIN_API_TOKEN",
+    )
+
     HTTP_TIMEOUT: float = Field(10.0, description="HTTP timeout seconds")
     LOG_LEVEL: str = Field("INFO", description="Log level")
     CHROMIUM_WS_ENDPOINT: str = Field(
