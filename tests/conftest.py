@@ -3,8 +3,8 @@ Shared pytest fixtures and stub implementations for tests.
 """
 from __future__ import annotations
 
-import asyncio
 import html
+from contextlib import asynccontextmanager
 from collections import defaultdict
 from typing import Any
 
@@ -15,11 +15,6 @@ from services.users_service.service import UserService
 
 def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line("markers", "asyncio: mark test as async (pytest-asyncio).")
-
-
-@pytest.fixture(scope="session")
-def event_loop_policy():
-    return asyncio.DefaultEventLoopPolicy()
 
 
 # ----- Stubs for UserService (no real Auth, DB, or Catalog) -----
@@ -35,11 +30,49 @@ class StubRegResolver:
         return f"https://catalog-{reg}.local"
 
 
+class StubGroupOwnership:
+    def __init__(self):
+        self.values = {}
+
+    async def get(self, reg, uid):
+        return set(self.values.get((reg, uid), set()))
+
+    async def set(self, reg, uid, ids):
+        self.values[(reg, uid)] = set(ids)
+
+    async def get_with_shared(self, reg, uid, base_url, *, desired, current):
+        # Tests may set `bases` to model multiple catalogs; default to one catalog.
+        bases = getattr(self, "bases", {})
+        shared = set()
+        for (other_reg, other_uid), ids in self.values.items():
+            if other_reg != reg and other_uid == uid and bases.get(other_reg, base_url) == base_url:
+                shared.update(ids)
+        return await self.get(reg, uid), shared
+
+
+class StubDepartmentGroups:
+    def __init__(self, values=None):
+        self.values = {"d1": 7} if values is None else values
+
+    async def resolve(self, reg, ids):
+        from common.exceptions import NetworkError
+        if any(identity not in self.values for identity in ids):
+            raise NetworkError(code="DEPARTMENT_GROUP_NOT_READY", message="Company synchronisation must confirm group IDs")
+        return {self.values[identity] for identity in ids}
+
+
 class StubCatalogClient:
     def __init__(self) -> None:
         self.users: dict[str, dict[str, Any]] = {}
         self.post_calls = 0
         self.post_calls_by_uid: dict[str, int] = defaultdict(int)
+
+    @asynccontextmanager
+    async def operation(self, base_url):
+        yield
+
+    async def get_user_create_page(self, base_url, cookies):
+        return '<form><input name="uid" value=""><input name="psw" value=""><input name="set" value=""></form>'
 
     async def get_user_page(self, base_url: str, uid: str, cookies: dict[str, str]) -> str | None:
         row = self.users.get(uid)
@@ -47,7 +80,7 @@ class StubCatalogClient:
             return None
         return self._render_user_form(row)
 
-    async def post_user(self, base_url: str, form_data: list[tuple[str, str]], cookies: dict[str, str]) -> None:
+    async def post_user(self, base_url: str, form_data: list[tuple[str, str]], cookies: dict[str, str], **kwargs) -> None:
         self.post_calls += 1
         parsed = self._parse_form_data(form_data)
         uid = parsed["uid"]
@@ -57,7 +90,7 @@ class StubCatalogClient:
     async def get_groups_page(self, base_url: str, cookies: dict[str, str]) -> str:
         groups_map = getattr(self, "_groups_map", {})
         if not groups_map:
-            return getattr(self, "_groups_html", "<html><body></body></html>")
+            return getattr(self, "_groups_html", '<form><input name="name"><input name="gn"><input name="cmd"></form>')
         parts = [f'<a href="grp?grp={gid}">{html.escape(title)}</a>' for title, gid in groups_map.items()]
         return "<html><body>" + "".join(parts) + "</body></html>"
 
@@ -129,4 +162,6 @@ def user_service(stub_auth_client: StubAuthClient, stub_reg_resolver: StubRegRes
         auth_client=stub_auth_client,  # type: ignore[arg-type]
         catalog_client=stub_catalog_client,  # type: ignore[arg-type]
         reg_resolver=stub_reg_resolver,
+        group_ownership=StubGroupOwnership(),
+        department_groups=StubDepartmentGroups(),
     )

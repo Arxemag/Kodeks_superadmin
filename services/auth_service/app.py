@@ -19,7 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from common import COMMON_VERSION
 from common.config import Settings, get_settings
-from common.db import get_db, healthcheck_db, shutdown_db
+from common.db import get_db, healthcheck_db, healthcheck_schema, shutdown_db
 from common.exceptions import ServiceError
 from common.http import shutdown_http
 from common.logger import get_logger, get_trace_id, set_trace_id
@@ -100,6 +100,15 @@ def create_app() -> FastAPI:
     async def health():
         """Проверка живости: выполняется healthcheck_db(); при успехе — 200 и {"status": "ok"}."""
         await healthcheck_db()
+        return {"status": "ok"}
+
+    @app.get("/api/expert/live")
+    async def live():
+        return {"status": "ok"}
+
+    @app.get("/api/expert/ready")
+    async def ready():
+        await healthcheck_schema()
         return {"status": "ok"}
 
     @app.get("/api/expert/metrics")

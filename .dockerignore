@@ -1,5 +1,7 @@
 # Виртуальное окружение и кэш
 .venv
+.venv-runtime
+.runtime
 venv
 env
 __pycache__

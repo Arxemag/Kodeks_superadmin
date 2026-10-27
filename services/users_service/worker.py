@@ -13,8 +13,8 @@ import json
 import random
 import signal
 import time
-from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from functools import partial
 from typing import Any
 
 import httpx
@@ -24,7 +24,10 @@ from pydantic import ValidationError
 from prometheus_client import start_http_server
 
 from common.config import get_settings
-from common.kafka import create_consumer, create_producer, unwrap_payload
+from common.kafka import (
+    MalformedJSON, OffsetTracker, create_consumer, create_producer, unwrap_payload,
+    dlq_payload, ensure_partition_assigned, get_assignment_epoch, process_partition_batch, record_coordinates,
+)
 from common.exceptions import AuthError, NetworkError, ParseError
 from common.logger import get_logger, set_trace_id
 from services.users_service.auth_client import AuthClient
@@ -48,48 +51,6 @@ from services.users_service.service import UserService
 
 
 logger = get_logger("users.worker")
-
-
-@dataclass
-class PartitionState:
-    """Состояние по партиции: последний закоммиченный offset и множество завершённых offset для последовательного коммита."""
-    committed: int = -1
-    completed: set[int] = field(default_factory=set)
-
-
-class OffsetTracker:
-    """
-    Учёт завершённых offset по партициям: при полном наборе подряд идущих завершённых
-    строит commit до следующего offset. Позволяет коммитить при неупорядоченном завершении задач.
-    """
-    def __init__(self) -> None:
-        self._states: dict[TopicPartition, PartitionState] = {}
-        self._lock = asyncio.Lock()
-
-    async def register(self, partition: TopicPartition, offset: int) -> None:
-        """Регистрирует партицию при первом появлении offset (инициализирует committed = offset - 1)."""
-        async with self._lock:
-            if partition in self._states:
-                return
-            self._states[partition] = PartitionState(committed=offset - 1)
-
-    async def complete_and_build_commit(
-        self,
-        partition: TopicPartition,
-        offset: int,
-    ) -> dict[TopicPartition, OffsetAndMetadata]:
-        """Помечает offset завершённым и возвращает карту для commit до следующего непрерывного offset."""
-        async with self._lock:
-            state = self._states.setdefault(partition, PartitionState(committed=offset - 1))
-            state.completed.add(offset)
-
-            next_offset = state.committed + 1
-            while next_offset in state.completed:
-                state.completed.remove(next_offset)
-                state.committed = next_offset
-                next_offset += 1
-
-            return {partition: OffsetAndMetadata(state.committed + 1, "")}
 
 
 async def run_worker() -> None:
@@ -138,7 +99,6 @@ async def run_worker() -> None:
         )
         tracker = OffsetTracker()
         semaphore = asyncio.Semaphore(settings.KAFKA_MAX_CONCURRENCY)
-        active_tasks: set[asyncio.Task[None]] = set()
 
         await producer.start()
         await consumer.start()
@@ -150,34 +110,27 @@ async def run_worker() -> None:
                 logger.debug(f"polled batch partitions={len(records_batch)}")
 
                 now_ms = int(time.time() * 1000)
-                max_lag_sec = 0.0
+                kafka_lag_seconds.set(max(
+                    (max(0.0, (now_ms - record.timestamp) / 1000.0)
+                     for records in records_batch.values() for record in records), default=0.0,
+                ))
 
-                for partition, records in records_batch.items():
-                    for record in records:
-                        await semaphore.acquire()
-                        lag_sec = max(0.0, (now_ms - record.timestamp) / 1000.0)
-                        if lag_sec > max_lag_sec:
-                            max_lag_sec = lag_sec
-                        await tracker.register(partition, record.offset)
+                batch_epoch = get_assignment_epoch(consumer)
 
-                        task = asyncio.create_task(
-                            _process_record(
-                                record=record,
-                                service=service,
-                                producer=producer,
-                                consumer=consumer,
-                                tracker=tracker,
-                                semaphore=semaphore,
-                                settings=settings,
-                            )
-                        )
-                        active_tasks.add(task)
-                        task.add_done_callback(active_tasks.discard)
+                async def process(partition, record):
+                    ensure_partition_assigned(consumer, partition, batch_epoch)
+                    await tracker.register(partition, record.offset)
+                    await semaphore.acquire()
+                    if get_assignment_epoch(consumer) != batch_epoch:
+                        semaphore.release()
+                        raise RuntimeError("Kafka assignment changed while waiting for capacity")
+                    await _process_record(
+                        record=record, service=service, producer=producer,
+                        consumer=consumer, tracker=tracker, semaphore=semaphore,
+                        settings=settings,
+                    )
 
-                kafka_lag_seconds.set(max_lag_sec)
-
-            if active_tasks:
-                await asyncio.gather(*active_tasks, return_exceptions=True)
+                await process_partition_batch(records_batch, process)
         finally:
             await consumer.stop()
             await producer.stop()
@@ -198,7 +151,9 @@ async def _process_record(
     active_jobs.inc()
     started = time.perf_counter()
     topic_partition = TopicPartition(record.topic, record.partition)
+    epoch = get_assignment_epoch(consumer)
     try:
+        ensure_partition_assigned(consumer, topic_partition, epoch)
         logger.debug(
             f"process start topic={record.topic} partition={record.partition} offset={record.offset}"
         )
@@ -208,10 +163,12 @@ async def _process_record(
             f"committing topic={record.topic} partition={record.partition} "
             f"next_offset={commit_map[topic_partition].offset}"
         )
+        ensure_partition_assigned(consumer, topic_partition, epoch)
         await consumer.commit(commit_map)
     except Exception as e:  # pragma: no cover
         users_failed_total.labels(reason="unhandled").inc()
         logger.exception(f"unexpected processing error topic={record.topic} offset={record.offset} err={e!r}")
+        raise
     finally:
         active_jobs.dec()
         processing_latency_histogram.observe(time.perf_counter() - started)
@@ -225,9 +182,14 @@ async def _handle_with_retries(
     settings: Any,
 ) -> None:
     """Валидация payload, определение топика и вызов handle_create/update/update_departments; при ошибках — DLQ или retry с backoff (AuthError/NetworkError)."""
+    send_dlq = partial(_send_dlq, source_record=record)
     payload_raw = unwrap_payload(record.value)
+    if isinstance(payload_raw, MalformedJSON):
+        await send_dlq(producer, settings.KAFKA_DLQ_TOPIC, payload_raw, "INVALID_JSON", payload_raw.error)
+        users_failed_total.labels(reason="invalid_json").inc()
+        return
     if not isinstance(payload_raw, dict):
-        await _send_dlq(
+        await send_dlq(
             producer,
             settings.KAFKA_DLQ_TOPIC,
             payload_raw,
@@ -237,11 +199,21 @@ async def _handle_with_retries(
         users_failed_total.labels(reason="invalid_payload").inc()
         return
 
+    if record.topic not in (
+        settings.KAFKA_CREATE_TOPIC, settings.KAFKA_UPDATE_TOPIC,
+        settings.KAFKA_UPDATE_DEPARTMENTS_TOPIC,
+    ):
+        await send_dlq(producer, settings.KAFKA_DLQ_TOPIC, payload_raw, "UNKNOWN_TOPIC", f"Unsupported topic: {record.topic}")
+        users_failed_total.labels(reason="unknown_topic").inc()
+        return
+
     set_trace_id(f"kafka-{record.topic}-{record.partition}-{record.offset}")
     redacted = redact_payload(payload_raw)
     logger.info(f"processing topic={record.topic} offset={record.offset} payload={redacted}")
 
     attempts = settings.USERS_RETRY_ATTEMPTS
+    if attempts < 1:
+        raise RuntimeError("Retry attempts must be at least one")
     for attempt in range(1, attempts + 1):
         logger.debug(
             f"attempt {attempt}/{attempts} topic={record.topic} partition={record.partition} offset={record.offset}"
@@ -260,25 +232,16 @@ async def _handle_with_retries(
                 await service.handle_update_departments(dto)
                 return
 
-            await _send_dlq(
-                producer,
-                settings.KAFKA_DLQ_TOPIC,
-                payload_raw,
-                "UNKNOWN_TOPIC",
-                f"Unsupported topic: {record.topic}",
-            )
-            users_failed_total.labels(reason="unknown_topic").inc()
-            return
         except (ValidationError, ParseError, ValueError) as e:
             logger.debug(
                 f"non-retryable error topic={record.topic} partition={record.partition} "
                 f"offset={record.offset} err={e!r}"
             )
-            await _send_dlq(
+            await send_dlq(
                 producer,
                 settings.KAFKA_DLQ_TOPIC,
                 payload_raw,
-                "VALIDATION_ERROR",
+                e.code if isinstance(e, ParseError) else "VALIDATION_ERROR",
                 str(e),
             )
             users_failed_total.labels(reason="validation_or_parse").inc()
@@ -289,7 +252,7 @@ async def _handle_with_retries(
                     f"non-retryable auth error topic={record.topic} partition={record.partition} "
                     f"offset={record.offset} code={e.code}"
                 )
-                await _send_dlq(
+                await send_dlq(
                     producer,
                     settings.KAFKA_DLQ_TOPIC,
                     payload_raw,
@@ -303,7 +266,7 @@ async def _handle_with_retries(
                     f"retry exhausted topic={record.topic} partition={record.partition} "
                     f"offset={record.offset} code={e.code} message={e.message!r}"
                 )
-                await _send_dlq(
+                await send_dlq(
                     producer,
                     settings.KAFKA_DLQ_TOPIC,
                     payload_raw,
@@ -330,7 +293,7 @@ async def _handle_with_retries(
                     f"retry exhausted topic={record.topic} partition={record.partition} "
                     f"offset={record.offset} code={e.code} message={e.message!r}"
                 )
-                await _send_dlq(
+                await send_dlq(
                     producer,
                     settings.KAFKA_DLQ_TOPIC,
                     payload_raw,
@@ -356,7 +319,7 @@ async def _handle_with_retries(
                 f"unexpected non-retryable topic={record.topic} partition={record.partition} "
                 f"offset={record.offset} err={e!r}"
             )
-            await _send_dlq(
+            await send_dlq(
                 producer,
                 settings.KAFKA_DLQ_TOPIC,
                 payload_raw,
@@ -380,11 +343,13 @@ async def _send_dlq(
     payload: Any,
     error_code: str,
     error_message: str,
+    *, source_record=None,
 ) -> None:
     """Отправляет в DLQ сообщение с original_message, error_code, error_message и timestamp; инкрементирует users_dlq_total."""
     logger.debug(f"send dlq topic={dlq_topic!r} code={error_code!r} message={error_message!r}")
     message = {
-        "original_message": payload,
+        "original_message": dlq_payload(payload),
+        **record_coordinates(source_record),
         "error_code": error_code,
         "error_message": error_message,
         "timestamp": datetime.now(timezone.utc).isoformat(),

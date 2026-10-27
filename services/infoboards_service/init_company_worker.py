@@ -12,8 +12,8 @@ import json
 import random
 import signal
 import time
-from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from functools import partial
 from typing import Any
 
 import httpx
@@ -24,7 +24,10 @@ from prometheus_client import start_http_server
 
 from common.config import get_settings
 from common.exceptions import AuthError, NetworkError, ParseError
-from common.kafka import create_consumer, create_producer, unwrap_payload
+from common.kafka import (
+    MalformedJSON, OffsetTracker, create_consumer, create_producer, unwrap_payload,
+    dlq_payload, ensure_partition_assigned, get_assignment_epoch, process_partition_batch, record_coordinates,
+)
 from common.logger import get_logger, set_trace_id
 from services.infoboards_service.dto import InitCompanyDTO, is_missing_department_id_error
 from services.infoboards_service.init_company_service import InitCompanyService
@@ -42,39 +45,6 @@ from services.users_service.reg_resolver import RegResolver
 
 
 logger = get_logger("init_company.worker")
-
-
-@dataclass
-class PartitionState:
-    """Состояние партиции для последовательного коммита."""
-    committed: int = -1
-    completed: set[int] = field(default_factory=set)
-
-
-class OffsetTracker:
-    """Учёт offset для коммита при неупорядоченном завершении."""
-
-    def __init__(self) -> None:
-        self._states: dict[TopicPartition, PartitionState] = {}
-        self._lock = asyncio.Lock()
-
-    async def register(self, partition: TopicPartition, offset: int) -> None:
-        async with self._lock:
-            if partition not in self._states:
-                self._states[partition] = PartitionState(committed=offset - 1)
-
-    async def complete_and_build_commit(
-        self, partition: TopicPartition, offset: int
-    ) -> dict[TopicPartition, OffsetAndMetadata]:
-        async with self._lock:
-            state = self._states.setdefault(partition, PartitionState(committed=offset - 1))
-            state.completed.add(offset)
-            next_offset = state.committed + 1
-            while next_offset in state.completed:
-                state.completed.remove(next_offset)
-                state.committed = next_offset
-                next_offset += 1
-            return {partition: OffsetAndMetadata(state.committed + 1, "")}
 
 
 async def run_worker() -> None:
@@ -112,7 +82,6 @@ async def run_worker() -> None:
 
     tracker = OffsetTracker()
     semaphore = asyncio.Semaphore(min(5, settings.KAFKA_MAX_CONCURRENCY))
-    active_tasks: set[asyncio.Task[None]] = set()
 
     from common.http import _default_headers
     async with httpx.AsyncClient(
@@ -130,35 +99,27 @@ async def run_worker() -> None:
                     continue
 
                 now_ms = int(time.time() * 1000)
-                max_lag = 0.0
+                init_company_lag_seconds.set(max(
+                    (max(0.0, (now_ms - record.timestamp) / 1000.0)
+                     for records in batch.values() for record in records), default=0.0,
+                ))
 
-                for partition, records in batch.items():
-                    for record in records:
-                        await semaphore.acquire()
-                        lag = max(0.0, (now_ms - record.timestamp) / 1000.0)
-                        if lag > max_lag:
-                            max_lag = lag
-                        await tracker.register(partition, record.offset)
-                        task = asyncio.create_task(
-                            _process_record(
-                                record=record,
-                                resolver=resolver,
-                                catalog_client=catalog_client,
-                                http_client=http_client,
-                                producer=producer,
-                                consumer=consumer,
-                                tracker=tracker,
-                                semaphore=semaphore,
-                                settings=settings,
-                            )
-                        )
-                        active_tasks.add(task)
-                        task.add_done_callback(active_tasks.discard)
+                batch_epoch = get_assignment_epoch(consumer)
 
-                init_company_lag_seconds.set(max_lag)
+                async def process(partition, record):
+                    ensure_partition_assigned(consumer, partition, batch_epoch)
+                    await tracker.register(partition, record.offset)
+                    await semaphore.acquire()
+                    if get_assignment_epoch(consumer) != batch_epoch:
+                        semaphore.release()
+                        raise RuntimeError("Kafka assignment changed while waiting for capacity")
+                    await _process_record(
+                        record=record, resolver=resolver, catalog_client=catalog_client,
+                        http_client=http_client, producer=producer, consumer=consumer,
+                        tracker=tracker, semaphore=semaphore, settings=settings,
+                    )
 
-            if active_tasks:
-                await asyncio.gather(*active_tasks, return_exceptions=True)
+                await process_partition_batch(batch, process)
         finally:
             await consumer.stop()
             await producer.stop()
@@ -181,16 +142,20 @@ async def _process_record(
     init_company_active_jobs.inc()
     started = time.perf_counter()
     tp = TopicPartition(record.topic, record.partition)
+    epoch = get_assignment_epoch(consumer)
     try:
+        ensure_partition_assigned(consumer, tp, epoch)
         await _handle_with_retries(
             record, resolver, catalog_client, http_client, producer, settings
         )
         commit_map = await tracker.complete_and_build_commit(tp, record.offset)
+        ensure_partition_assigned(consumer, tp, epoch)
         await consumer.commit(commit_map)
         init_company_total.inc()
     except Exception as e:
         init_company_failed_total.labels(reason="unhandled").inc()
         logger.exception(f"init_company unexpected error topic={record.topic} offset={record.offset} err={e!r}")
+        raise
     finally:
         init_company_active_jobs.dec()
         init_company_processing_histogram.observe(time.perf_counter() - started)
@@ -220,6 +185,7 @@ async def _handle_with_retries(
     settings: Any,
 ) -> None:
     """Валидация, вызов InitCompanyService, retry/DLQ при ошибках."""
+    send_dlq = partial(_send_dlq, source_record=record)
     raw_value = record.value
     # Что реально пришло из Kafka (включите DEBUG, чтобы увидеть, почему нет reg)
     if isinstance(raw_value, dict):
@@ -232,8 +198,12 @@ async def _handle_with_retries(
         logger.debug("init_company raw value type=%s", type(raw_value).__name__)
 
     payload = unwrap_payload(raw_value)
+    if isinstance(payload, MalformedJSON):
+        await send_dlq(producer, settings.KAFKA_INIT_COMPANY_DLQ_TOPIC, payload, "INVALID_JSON", payload.error)
+        init_company_failed_total.labels(reason="invalid_json").inc()
+        return
     if not isinstance(payload, dict):
-        await _send_dlq(
+        await send_dlq(
             producer, settings.KAFKA_INIT_COMPANY_DLQ_TOPIC,
             payload, "INVALID_PAYLOAD", "Payload is not an object",
         )
@@ -258,7 +228,7 @@ async def _handle_with_retries(
     if payload.get("id") is None:
         for key in ("companyId", "company_id"):
             if payload.get(key) is not None:
-                payload = {**payload, "id": int(payload[key])}
+                payload = {**payload, "id": payload[key]}
                 break
 
     # Нормализация: companyDepartments → departments (продюсер может слать только companyDepartments)
@@ -274,13 +244,15 @@ async def _handle_with_retries(
     logger.debug("init_company payload keys: %s", list(payload.keys()))
 
     attempts = settings.USERS_RETRY_ATTEMPTS
+    if attempts < 1:
+        raise RuntimeError("Retry attempts must be at least one")
     for attempt in range(1, attempts + 1):
         try:
             dto = InitCompanyDTO.model_validate(payload)
         except ValidationError as e:
             if is_missing_department_id_error(e):
                 logger.warning("В отделе отсутствует id (departments[].id). Укажите UUID для каждого отдела.")
-            await _send_dlq(
+            await send_dlq(
                 producer, settings.KAFKA_INIT_COMPANY_DLQ_TOPIC,
                 payload, "VALIDATION_ERROR", str(e),
             )
@@ -301,22 +273,22 @@ async def _handle_with_retries(
             try:
                 await service.handle(dto)
             except (ValidationError, ParseError, ValueError) as e:
-                await _send_dlq(
+                await send_dlq(
                     producer, settings.KAFKA_INIT_COMPANY_DLQ_TOPIC,
-                    payload, "VALIDATION_ERROR", str(e),
+                    payload, e.code if isinstance(e, ParseError) else "VALIDATION_ERROR", str(e),
                 )
                 init_company_failed_total.labels(reason="validation_or_parse").inc()
                 return
             except AuthError as e:
                 if e.code == "REG_NOT_FOUND":
-                    await _send_dlq(
+                    await send_dlq(
                         producer, settings.KAFKA_INIT_COMPANY_DLQ_TOPIC,
                         payload, e.code, e.message,
                     )
                     init_company_failed_total.labels(reason="reg_not_found").inc()
                     return
                 if attempt == attempts:
-                    await _send_dlq(producer, settings.KAFKA_INIT_COMPANY_DLQ_TOPIC, payload, e.code, e.message)
+                    await send_dlq(producer, settings.KAFKA_INIT_COMPANY_DLQ_TOPIC, payload, e.code, e.message)
                     init_company_failed_total.labels(reason="retry_exhausted").inc()
                     return
                 init_company_retry_total.inc()
@@ -324,7 +296,7 @@ async def _handle_with_retries(
                 continue
             except NetworkError as e:
                 if attempt == attempts:
-                    await _send_dlq(producer, settings.KAFKA_INIT_COMPANY_DLQ_TOPIC, payload, e.code, e.message)
+                    await send_dlq(producer, settings.KAFKA_INIT_COMPANY_DLQ_TOPIC, payload, e.code, e.message)
                     init_company_failed_total.labels(reason="retry_exhausted").inc()
                     return
                 init_company_retry_total.inc()
@@ -345,10 +317,12 @@ async def _send_dlq(
     payload: Any,
     error_code: str,
     error_message: str,
+    *, source_record=None,
 ) -> None:
     """Отправка в DLQ."""
     msg = {
-        "original_message": payload,
+        "original_message": dlq_payload(payload),
+        **record_coordinates(source_record),
         "error_code": error_code,
         "error_message": error_message,
         "timestamp": datetime.now(timezone.utc).isoformat(),

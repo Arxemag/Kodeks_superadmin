@@ -5,11 +5,22 @@ name: Deploy release -> server
 on:
   push:
     branches: [release]
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      start_worker:
+        description: 'Start consumption after server acceptance checks'
+        type: boolean
+        default: false
 
 jobs:
+  tests:
+    uses: ./.github/workflows/test.yml
   deploy:
+    needs: tests
     runs-on: ubuntu-latest
+    concurrency:
+      group: kodeks-production-deploy
+      cancel-in-progress: false
     steps:
       - name: SSH deploy
         uses: appleboy/ssh-action@v1.2.0
@@ -23,6 +34,11 @@ jobs:
             cd /home/user/kodeks_superadmin
             test -f .env || { echo "НЕТ .env на сервере — создайте прод-.env"; exit 1; }
             git fetch --all --prune
-            git reset --hard origin/release
-            docker compose up -d --build
-            docker compose ps
+            tested_commit='${{ github.sha }}'
+            release_commit=$(git rev-parse origin/release)
+            if [ "$tested_commit" != "$release_commit" ]; then
+              echo "Release moved since tests or this workflow was started on another branch; refusing untested deploy"
+              exit 1
+            fi
+            git reset --hard "$tested_commit"
+            DEPLOY_COMMIT="$tested_commit" START_WORKER=${{ inputs.start_worker && '1' || '0' }} bash scripts/deploy.sh

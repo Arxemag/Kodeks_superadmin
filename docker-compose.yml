@@ -3,7 +3,7 @@
 # KAFKA_BOOTSTRAP_SERVERS на брокер. chromium наружу НЕ публикуется (нужен только воркеру по сети compose).
 services:
   chromium:
-    image: browserless/chrome:latest
+    image: browserless/chrome@sha256:57d19e414d9fe4ae9d2ab12ba768c97f38d51246c5b31af55a009205c136012f
     environment:
       - PORT=3000
       - CONNECTION_TIMEOUT=120000
@@ -25,6 +25,12 @@ services:
     depends_on:
       - chromium
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:'+os.getenv('PORT','8000')+'/api/expert/ready',timeout=5)"]
+      interval: 10s
+      timeout: 6s
+      retries: 6
+      start_period: 10s
 
   worker:
     build: .
@@ -35,9 +41,12 @@ services:
       - CHROMIUM_WS_ENDPOINT=${CHROMIUM_WS_ENDPOINT:-ws://chromium:3000}
       # Воркер ходит за куками админа по HTTP к Auth API ПО ИМЕНИ СЕРВИСА compose,
       # а не на 127.0.0.1 (это его собственный контейнер, где API нет). Перебивает .env.
-      - AUTH_SERVICE_URL=http://auth-api:8000
+      - AUTH_SERVICE_URL=http://auth-api:${PORT:-8000}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
-      - chromium
+      chromium:
+        condition: service_started
+      auth-api:
+        condition: service_healthy
     restart: unless-stopped

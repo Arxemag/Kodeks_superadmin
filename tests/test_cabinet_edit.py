@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import pytest
+from common.exceptions import ParseError
 
 from services.infoboards_service import cabinet_edit
 from services.infoboards_service.cabinet_edit import BoardConfig, correct_cabinet
@@ -104,9 +105,8 @@ async def test_ambiguous_target_not_touched(monkeypatch):
     link = "https://host/docs/?nd=1&infoboard=R0"
     questions = [{"question": "Тестовый вопрос про процедуры", "answers": ["Оставить А"]}]
 
-    plans = await correct_cabinet("https://host", None, {}, link, questions, dry_run=True, qmap=QMAP)
-    assert plans[0].action == "ambiguous"
-    assert set(plans[0].delete_headers) == {"R3", "R9"}  # конфликтующие борды
+    with pytest.raises(ParseError, match="ambiguous"):
+        await correct_cabinet("https://host", None, {}, link, questions, dry_run=True, qmap=QMAP)
 
 
 @pytest.mark.asyncio
@@ -116,48 +116,47 @@ async def test_unknown_question_skipped(monkeypatch):
     link = "https://host/docs/?nd=1&infoboard=R0"
     questions = [{"question": "Совершенно другой вопрос", "answers": ["что-то"]}]
 
-    plans = await correct_cabinet("https://host", None, {}, link, questions, dry_run=True, qmap=QMAP)
-    assert plans[0].action == "unknown-question"
+    with pytest.raises(ParseError, match="unknown-question"):
+        await correct_cabinet("https://host", None, {}, link, questions, dry_run=True, qmap=QMAP)
 
 
 @pytest.mark.asyncio
-async def test_crawl_skips_broken_subcabinet(monkeypatch):
-    """Битая ссылка на под-кабинет (404 -> NetworkError) не роняет обход; цель находится."""
+async def test_missing_linked_board_does_not_hide_valid_target(monkeypatch):
+    from common.exceptions import NetworkError
     tree = dict(TREE)
-    # у ПРОМЕЖУТОЧНОГО (R2) появляется ссылка на несуществующий борд RBAD + рабочая на цель R3
-    tree["R2"] = BoardConfig("R2", "a", "Промежуточный", None,
-                             [_link("битая", "RBAD"), _link("к цели", "R3"), _back()])
+    tree['R2'] = BoardConfig('R2', 'a', 'Intermediate', None, [_link('broken', 'RBAD'), _link('target', 'R3')])
+    async def fetch(base_url, client, cookies, board_id):
+        if board_id == 'RBAD':
+            raise NetworkError(code='GRAPHQL_4XX', message='GraphQL status=404')
+        board = tree[board_id]
+        return BoardConfig(board.id, board.author, board.title, board.search_string, list(board.widgets))
+    monkeypatch.setattr(cabinet_edit, 'fetch_board', fetch)
+    plans = await correct_cabinet('https://host', None, {}, '?infoboard=R0', [
+        {'question': QMAP[0]['question'], 'answers': ['Оставить А']},
+    ], dry_run=True, qmap=QMAP)
+    assert plans[0].sub_id == 'R3'
 
-    async def fake_fetch_board(base_url, client, cookies, board_id):
-        if board_id == "RBAD":
-            from common.exceptions import NetworkError
-            raise NetworkError(code="GRAPHQL_4XX", message="GraphQL status=404 P000S not found")
-        b = tree.get(board_id)
-        if b is None:
-            from common.exceptions import ParseError
-            raise ParseError(code="BOARD_NOT_FOUND", message=board_id)
-        return BoardConfig(b.id, b.author, b.title, b.search_string, list(b.widgets))
-    monkeypatch.setattr(cabinet_edit, "fetch_board", fake_fetch_board)
 
-    link = "https://host/docs/?nd=1&infoboard=R0"
-    questions = [{"question": "Тестовый вопрос про процедуры", "answers": ["Оставить А"]}]
-    plans = await correct_cabinet("https://host", None, {}, link, questions, dry_run=True, qmap=QMAP)
-
-    assert len(plans) == 1
-    assert plans[0].action == "prune"          # цель R3 найдена, несмотря на битый RBAD
-    assert plans[0].sub_id == "R3"
-    assert set(plans[0].delete_headers) == {"Виджет Б", "Виджет В"}
+@pytest.mark.asyncio
+async def test_catalog_timeout_is_not_treated_as_a_broken_link(monkeypatch):
+    from common.exceptions import NetworkError
+    from unittest.mock import AsyncMock
+    monkeypatch.setattr(cabinet_edit, 'fetch_board', AsyncMock(side_effect=NetworkError(code='GRAPHQL_REQUEST_FAILED')))
+    with pytest.raises(NetworkError):
+        await correct_cabinet('https://host', None, {}, '?infoboard=R0', [], dry_run=True, qmap=QMAP)
 
 
 @pytest.mark.asyncio
 async def test_apply_calls_set_widgets_with_kept(monkeypatch):
     """Вне dry-run вызывается set_widgets с виджетами БЕЗ удаляемых, но С системными и выбранным."""
-    _patch_tree(monkeypatch, TREE)
+    tree = dict(TREE)
+    _patch_tree(monkeypatch, tree)
     captured = {}
 
     async def fake_set_widgets(base_url, client, cookies, board, widget_inputs):
         captured["board_id"] = board.id
         captured["headers"] = [w.get("header") for w in widget_inputs]
+        tree[board.id] = BoardConfig(board.id, board.author, board.title, board.search_string, widget_inputs)
     monkeypatch.setattr(cabinet_edit, "set_widgets", fake_set_widgets)
 
     link = "https://host/docs/?nd=1&infoboard=R0"
@@ -167,3 +166,51 @@ async def test_apply_calls_set_widgets_with_kept(monkeypatch):
 
     assert captured["board_id"] == "R3"
     assert set(captured["headers"]) == {"Виджет А", cabinet_edit.BACK_HEADER}  # Б и В удалены
+
+
+@pytest.mark.asyncio
+async def test_invalid_later_question_prevents_all_writes(monkeypatch):
+    from unittest.mock import AsyncMock
+    _patch_tree(monkeypatch, TREE)
+    save = AsyncMock()
+    monkeypatch.setattr(cabinet_edit, "set_widgets", save)
+    with pytest.raises(ParseError):
+        await correct_cabinet("https://host", None, {}, "?infoboard=R0", [
+            {"question": QMAP[0]["question"], "answers": ["Оставить А"]},
+            {"question": "Unknown", "answers": []},
+        ], qmap=QMAP)
+    save.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unknown_answer_cannot_delete_known_widgets(monkeypatch):
+    from unittest.mock import AsyncMock
+    _patch_tree(monkeypatch, TREE)
+    save = AsyncMock()
+    monkeypatch.setattr(cabinet_edit, "set_widgets", save)
+    with pytest.raises(ParseError, match="Unknown answer"):
+        await correct_cabinet("https://host", None, {}, "?infoboard=R0", [
+            {"question": QMAP[0]["question"], "answers": ["Unknown"]},
+        ], qmap=QMAP)
+    save.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_noop_widget_save_is_not_success(monkeypatch):
+    from unittest.mock import AsyncMock
+    _patch_tree(monkeypatch, TREE)
+    monkeypatch.setattr(cabinet_edit, "set_widgets", AsyncMock())
+    with pytest.raises(ParseError, match="not applied"):
+        await correct_cabinet("https://host", None, {}, "?infoboard=R0", [
+            {"question": QMAP[0]["question"], "answers": ["Оставить А"]},
+        ], qmap=QMAP)
+
+
+@pytest.mark.asyncio
+async def test_mutation_timeout_is_not_treated_as_retryable_read_failure(monkeypatch):
+    from unittest.mock import AsyncMock
+    from common.exceptions import NetworkError
+    monkeypatch.setattr(cabinet_edit, '_graphql', AsyncMock(side_effect=NetworkError(code='GRAPHQL_REQUEST_FAILED')))
+    with pytest.raises(ParseError) as error:
+        await cabinet_edit.set_widgets('https://host', None, {}, TREE['R3'], [])
+    assert error.value.code == 'WIDGET_WRITE_UNCERTAIN'

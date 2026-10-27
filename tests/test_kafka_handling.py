@@ -36,11 +36,14 @@ def test_kafka_json_roundtrip() -> None:
     assert back == payload
 
 
-def test_kafka_deserializer_invalid_json_raises() -> None:
-    """Невалидный JSON в сообщении — десериализатор бросает исключение (воркер должен обработать)."""
-    from common.kafka import _json_deserializer
-    with pytest.raises((json.JSONDecodeError, ValueError)):
-        _json_deserializer(b"not json {")
+@pytest.mark.parametrize("raw", [b"not json {", b"\xff\xfe"])
+def test_kafka_deserializer_retains_invalid_bytes_for_dlq(raw) -> None:
+    import base64
+    from common.kafka import MalformedJSON, _json_deserializer
+    malformed = _json_deserializer(raw)
+    assert isinstance(malformed, MalformedJSON)
+    assert base64.b64decode(malformed.raw_base64) == raw
+    assert malformed.error
 
 
 def test_kafka_unwrap_payload_envelope() -> None:
@@ -243,37 +246,168 @@ async def test_init_company_handle_invalid_payload_sends_dlq() -> None:
     assert producer.send_and_wait.call_args[0][0] == settings.KAFKA_INIT_COMPANY_DLQ_TOPIC
 
 
-def test_reg_company_process_one_valid_enable_no_raise() -> None:
-    """Валидный payload enable_reg_company — без исключения."""
+@pytest.mark.parametrize('topic,payload,expected', [
+    ('enable_reg_company', {'reg': '123', 'oldReg': '456', 'companyName': 'OOO'}, 'NOT_IMPLEMENTED'),
+    ('disable_reg_company', {'reg': '123', 'companyName': 'OOO'}, 'NOT_IMPLEMENTED'),
+    ('enable_reg_company', None, 'INVALID_PAYLOAD'),
+    ('enable_reg_company', {}, 'VALIDATION_ERROR'),
+])
+def test_reg_company_never_claims_unsupported_action_succeeded(topic, payload, expected):
+    from common.exceptions import ParseError
+    settings = SimpleNamespace(KAFKA_ENABLE_REG_COMPANY_TOPIC='enable_reg_company',
+                               KAFKA_DISABLE_REG_COMPANY_TOPIC='disable_reg_company')
+    record = _fake_record(topic, payload)
+    with pytest.raises(ParseError) as error:
+        reg_company_process_one(record, settings)
+    assert error.value.code == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('handler_name', ['users', 'init_company', 'correct_cabinet'])
+@pytest.mark.parametrize('raw', [b'not-json', b'\xff', b'{"payload":"not-json"}'])
+async def test_malformed_json_reaches_handler_dlq_as_serializable_bytes(handler_name, raw):
+    import base64
+    from common.kafka import _json_deserializer, _json_serializer
+    from services.infoboards_service.correct_cabinet_worker import _handle_with_retries as correct_handle
     settings = MagicMock()
-    settings.KAFKA_ENABLE_REG_COMPANY_TOPIC = "enable_reg_company"
-    settings.KAFKA_DISABLE_REG_COMPANY_TOPIC = "disable_reg_company"
-    record = SimpleNamespace(topic="enable_reg_company", offset=0, value={"reg": "123", "oldReg": "456", "companyName": "OOO"})
-    reg_company_process_one(record, settings)
+    settings.KAFKA_DLQ_TOPIC = 'users-dlq'
+    settings.KAFKA_INIT_COMPANY_DLQ_TOPIC = 'init-dlq'
+    settings.KAFKA_CORRECT_CABINET_DLQ_TOPIC = 'correct-dlq'
+    producer = AsyncMock()
+    record = _fake_record('test-topic', _json_deserializer(raw))
+    if handler_name == 'users':
+        await users_handle(record, MagicMock(), producer, settings)
+    elif handler_name == 'init_company':
+        await init_company_handle(record, MagicMock(), MagicMock(), MagicMock(), producer, settings)
+    else:
+        await correct_handle(record, MagicMock(), MagicMock(), producer, settings)
+    message = producer.send_and_wait.await_args.args[1]
+    assert message['error_code'] == 'INVALID_JSON'
+    _json_serializer(message)  # Kafka's real serializer must accept the DLQ body.
+    expected = b'not-json' if raw.startswith(b'{') else raw
+    assert base64.b64decode(message['original_message']['raw_base64']) == expected
 
 
-def test_reg_company_process_one_valid_disable_no_raise() -> None:
-    """Валидный payload disable_reg_company — без исключения."""
+@pytest.mark.asyncio
+@pytest.mark.parametrize('worker_name', ['users', 'init_company', 'correct_cabinet'])
+async def test_standalone_dlq_failure_never_commits_or_swallows(worker_name):
+    import asyncio
+    from aiokafka import TopicPartition
+    from common.kafka import OffsetTracker
+    from services.users_service.worker import _process_record as process_users
+    from services.infoboards_service.init_company_worker import _process_record as process_init
+    from services.infoboards_service.correct_cabinet_worker import _process_record as process_correct
+    record = _fake_record('topic', 'invalid-payload', offset=5)
+    tp = TopicPartition(record.topic, record.partition)
     settings = MagicMock()
-    settings.KAFKA_ENABLE_REG_COMPANY_TOPIC = "enable_reg_company"
-    settings.KAFKA_DISABLE_REG_COMPANY_TOPIC = "disable_reg_company"
-    record = SimpleNamespace(topic="disable_reg_company", offset=1, value={"reg": "123", "companyName": "OOO"})
-    reg_company_process_one(record, settings)
+    settings.KAFKA_DLQ_TOPIC = 'users-dlq'
+    settings.KAFKA_INIT_COMPANY_DLQ_TOPIC = 'init-dlq'
+    settings.KAFKA_CORRECT_CABINET_DLQ_TOPIC = 'correct-dlq'
+    producer = AsyncMock()
+    producer.send_and_wait.side_effect = RuntimeError('DLQ is unavailable')
+    consumer = MagicMock()
+    consumer.assignment.return_value = {tp}
+    consumer.commit = AsyncMock()
+    tracker = OffsetTracker()
+    await tracker.register(tp, record.offset)
+    common = dict(producer=producer, consumer=consumer, settings=settings)
+    with pytest.raises(RuntimeError, match='DLQ is unavailable'):
+        if worker_name == 'users':
+            await process_users(record=record, service=MagicMock(), tracker=tracker,
+                                semaphore=asyncio.Semaphore(0), **common)
+        elif worker_name == 'init_company':
+            await process_init(record=record, resolver=MagicMock(), catalog_client=MagicMock(),
+                               http_client=MagicMock(), tracker=tracker,
+                               semaphore=asyncio.Semaphore(0), **common)
+        else:
+            await process_correct(record, tp, resolver=MagicMock(), http_client=MagicMock(), **common)
+    consumer.commit.assert_not_awaited()
+    producer.send_and_wait.assert_awaited_once()
 
 
-def test_reg_company_process_one_invalid_payload_not_dict_no_raise() -> None:
-    """Payload не dict — логируем warning, не падаем."""
-    settings = MagicMock()
-    settings.KAFKA_ENABLE_REG_COMPANY_TOPIC = "enable_reg_company"
-    settings.KAFKA_DISABLE_REG_COMPANY_TOPIC = "disable_reg_company"
-    record = SimpleNamespace(topic="enable_reg_company", offset=0, value=None)
-    reg_company_process_one(record, settings)
+@pytest.mark.asyncio
+async def test_correct_cabinet_dry_run_has_no_success_event_and_uses_catalog_lock():
+    from contextlib import asynccontextmanager
+    from services.infoboards_service.correct_cabinet_worker import _handle_with_retries as correct_handle
+    held = False
+    @asynccontextmanager
+    async def operation(base_url):
+        nonlocal held
+        held = True
+        try:
+            yield
+        finally:
+            held = False
+    @asynccontextmanager
+    async def session():
+        yield MagicMock()
+    resolver = MagicMock()
+    resolver.resolve_base_url = AsyncMock(return_value='https://catalog.test')
+    resolver.with_session = session
+    settings = SimpleNamespace(KAFKA_CORRECT_CABINET_DLQ_TOPIC='correct-dlq',
+                               KAFKA_CABINET_CORRECTED_TOPIC='done', USERS_RETRY_ATTEMPTS=1,
+                               CORRECT_CABINET_DRY_RUN=True)
+    record = _fake_record('correct-cabinet', {'reg': '123', 'link': '?infoboard=one', 'questions': []})
+    async def plan(*args, **kwargs):
+        assert held
+        assert kwargs['dry_run'] is True
+        return []
+    producer = AsyncMock()
+    with patch('services.infoboards_service.correct_cabinet_worker.catalog_operation', operation), \
+         patch('services.infoboards_service.correct_cabinet_worker.AuthService') as auth, \
+         patch('services.infoboards_service.correct_cabinet_worker.correct_cabinet', side_effect=plan):
+        auth.return_value.login = AsyncMock(return_value={})
+        await correct_handle(record, resolver, MagicMock(), producer, settings)
+    assert not held
+    producer.send_and_wait.assert_not_awaited()
 
 
-def test_reg_company_process_one_validation_error_no_raise() -> None:
-    """Невалидный payload (нет полей) — логируем warning, не падаем."""
-    settings = MagicMock()
-    settings.KAFKA_ENABLE_REG_COMPANY_TOPIC = "enable_reg_company"
-    settings.KAFKA_DISABLE_REG_COMPANY_TOPIC = "disable_reg_company"
-    record = SimpleNamespace(topic="enable_reg_company", offset=0, value={})
-    reg_company_process_one(record, settings)
+@pytest.mark.asyncio
+@pytest.mark.parametrize('payload,expected_code', [
+    ({'reg': '123', 'oldReg': '456', 'companyName': 'OOO'}, 'NOT_IMPLEMENTED'),
+    ({}, 'VALIDATION_ERROR'),
+    (None, 'INVALID_PAYLOAD'),
+])
+async def test_registration_failure_reaches_dlq_before_commit(payload, expected_code):
+    from aiokafka import TopicPartition
+    from services.reg_company_service.worker import _process_record
+    trace = []
+    settings = SimpleNamespace(KAFKA_ENABLE_REG_COMPANY_TOPIC='enable_reg_company',
+                               KAFKA_DISABLE_REG_COMPANY_TOPIC='disable_reg_company',
+                               KAFKA_REG_COMPANY_DLQ_TOPIC='reg-company-dlq')
+    record = _fake_record('enable_reg_company', payload, offset=33)
+    partition = TopicPartition(record.topic, record.partition)
+    async def publish(topic, message):
+        assert topic == 'reg-company-dlq'
+        assert message['error_code'] == expected_code
+        assert message['source_offset'] == 33
+        trace.append('dlq')
+    async def commit(offsets):
+        assert offsets[partition].offset == 34
+        trace.append('commit')
+    consumer = MagicMock()
+    consumer.assignment.return_value = {partition}
+    consumer.commit = AsyncMock(side_effect=commit)
+    producer = AsyncMock()
+    producer.send_and_wait.side_effect = publish
+    await _process_record(record, partition, producer=producer, consumer=consumer, settings=settings)
+    assert trace == ['dlq', 'commit']
+
+
+@pytest.mark.asyncio
+async def test_registration_dlq_failure_is_fatal_without_commit():
+    from aiokafka import TopicPartition
+    from services.reg_company_service.worker import _process_record
+    settings = SimpleNamespace(KAFKA_ENABLE_REG_COMPANY_TOPIC='enable_reg_company',
+                               KAFKA_DISABLE_REG_COMPANY_TOPIC='disable_reg_company',
+                               KAFKA_REG_COMPANY_DLQ_TOPIC='reg-company-dlq')
+    record = _fake_record('enable_reg_company', {'reg': '123', 'oldReg': '456', 'companyName': 'OOO'}, offset=33)
+    partition = TopicPartition(record.topic, record.partition)
+    consumer = MagicMock()
+    consumer.assignment.return_value = {partition}
+    consumer.commit = AsyncMock()
+    producer = AsyncMock()
+    producer.send_and_wait.side_effect = RuntimeError('DLQ unavailable')
+    with pytest.raises(RuntimeError, match='DLQ unavailable'):
+        await _process_record(record, partition, producer=producer, consumer=consumer, settings=settings)
+    consumer.commit.assert_not_awaited()

@@ -37,18 +37,24 @@ async def open_chromium(playwright: Any, logger: Any = None):
     endpoint = get_settings().CHROMIUM_WS_ENDPOINT.strip()
     if endpoint:
         errors: list[str] = []
+        browser = None
         for candidate in _build_cdp_candidates(endpoint):
             try:
                 browser = await playwright.chromium.connect_over_cdp(candidate, timeout=30000)
-                if logger:
-                    logger.debug("Playwright connected to remote Chromium via CDP: %s", candidate)
-                try:
-                    yield browser
-                finally:
-                    await browser.close()
-                return
             except Exception as e:  # pragma: no cover
                 errors.append(f"{candidate}: {e!r}")
+                continue
+            if logger:
+                logger.debug("Playwright connected to remote Chromium via CDP: %s", candidate)
+            break
+        if browser is not None:
+            # Errors raised by the caller's operation must propagate unchanged.
+            # Retrying the context body could submit the same form twice.
+            try:
+                yield browser
+            finally:
+                await browser.close()
+            return
         if logger:
             logger.warning(
                 "Remote Chromium unavailable (CHROMIUM_WS_ENDPOINT=%r). Fallback to local launch(). Errors: %s",

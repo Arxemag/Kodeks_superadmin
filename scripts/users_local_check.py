@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import html
+from contextlib import asynccontextmanager
 from collections import defaultdict
 from typing import Any
 
@@ -19,11 +20,29 @@ class StubRegResolver:
         return f"https://catalog-{reg}.local"
 
 
+class StubGroupOwnership:
+    def __init__(self) -> None:
+        self.values: dict[tuple[str, str], set[int]] = {}
+
+    async def get_with_shared(self, reg, uid, base_url, *, desired, current):
+        return set(self.values.get((reg, uid), set())), set()
+
+    async def set(self, reg, uid, ids):
+        self.values[(reg, uid)] = set(ids)
+
+
 class StubCatalogClient:
     def __init__(self) -> None:
         self.users: dict[str, dict[str, Any]] = {}
         self.post_calls = 0
         self.post_calls_by_uid: dict[str, int] = defaultdict(int)
+
+    @asynccontextmanager
+    async def operation(self, base_url):
+        yield
+
+    async def get_user_create_page(self, base_url, cookies):
+        return '<form><input name="uid" value=""><input name="psw" value=""><input name="set" value=""></form>'
 
     async def get_user_page(self, base_url: str, uid: str, cookies: dict[str, str]) -> str | None:
         row = self.users.get(uid)
@@ -31,7 +50,7 @@ class StubCatalogClient:
             return None
         return self._render_user_form(row)
 
-    async def post_user(self, base_url: str, form_data: list[tuple[str, str]], cookies: dict[str, str]) -> None:
+    async def post_user(self, base_url: str, form_data: list[tuple[str, str]], cookies: dict[str, str], **kwargs) -> None:
         self.post_calls += 1
         parsed = self._parse_form_data(form_data)
         uid = parsed["uid"]
@@ -85,6 +104,7 @@ async def main() -> None:
         auth_client=StubAuthClient(),  # type: ignore[arg-type]
         catalog_client=catalog,  # type: ignore[arg-type]
         reg_resolver=StubRegResolver(),  # type: ignore[arg-type]
+        group_ownership=StubGroupOwnership(),  # type: ignore[arg-type]
     )
 
     await service.handle_create(

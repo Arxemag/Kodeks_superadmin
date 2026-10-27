@@ -48,6 +48,14 @@ class CreateUserDTO(BaseModel):
 class UpdateUserDTO(CreateUserDTO):
     """Сообщение топика update-user: наследует CreateUserDTO, дополнительно опциональное поле id для POST обновления."""
     id: str | None = None
+    psw: str | None = Field(None, min_length=1)
+
+    @field_validator("psw")
+    @classmethod
+    def reject_null_password(cls, value):
+        if value is None:
+            raise ValueError("Omit psw to preserve the existing password; null is not a password")
+        return value
 
 
 class DepartmentDTO(BaseModel):
@@ -64,14 +72,7 @@ class UpdateUserDepartmentsDTO(BaseModel):
 
     reg: str = Field(..., min_length=1)
     id: str = Field(..., min_length=1)
-    departments: list[DepartmentDTO] = Field(..., min_length=1)
-
-    @field_validator("departments")
-    @classmethod
-    def validate_departments(cls, value: list[DepartmentDTO]) -> list[DepartmentDTO]:
-        if not value:
-            raise ValueError("departments must not be empty")
-        return value
+    departments: list[DepartmentDTO]
 
 
 def redact_payload(payload: dict[str, Any]) -> dict[str, Any]:

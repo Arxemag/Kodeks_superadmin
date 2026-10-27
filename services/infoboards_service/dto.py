@@ -62,6 +62,7 @@ class InitCompanyDTO(BaseModel):
     reg: str
     companyName: str = ""
     departments: list[DepartmentPayload] = Field(default_factory=list)
+    allow_empty_snapshot: bool = False
 
 
 def is_missing_department_id_error(e: BaseException) -> bool:

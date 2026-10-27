@@ -1,6 +1,8 @@
 # Топики Kafka и форматы payload
 
-Единый воркер (`main_unified_worker.py`) подписан на все топики ниже. Сообщение может быть в обёртке `{ "event_id", "event_type", "payload" }` — тогда маршрутизация по `event_type` (или по `record.topic`).
+Единый воркер (`main_unified_worker.py`) подписан на все топики ниже. Сообщение может быть в обёртке `{ "event_id", "event_type", "payload" }` — тогда маршрутизация по `event_type` (или по `record.topic`). Вход сохраняется в PostgreSQL до подтверждения Kafka; исходящие сообщения отправляются из outbox с устойчивым `event_id` в заголовке. Само подтверждение Kafka означает сохранение входа, а не выполнение операции в каталоге.
+
+Входной `event_id` должен быть стабильным при повторной отправке одного и того же события. Для старых событий без `event_id` используются координаты Kafka; повторная публикация с другим offset не распознаётся как тот же вход. Поле `schema_version`, если передано, должно равняться числу `1`; неподдерживаемые версии попадают в DLQ. Необязательный `source_revision` должен быть неотрицательным целым числом; без него порядок между разными топиками не гарантирован.
 
 ---
 
@@ -29,11 +31,11 @@ DTO: `CreateUserDTO` (services/users_service/dto.py).
 ## 2. Обновление пользователя
 
 - **topic:** `update-user`
-- **payload:** как в create-user, плюс:
+- **payload:** `reg` и `uid` обязательны, остальные поля как в create-user; `psw` можно не передавать, тогда текущий пароль сохраняется. Явный `null` или пустой пароль не допускаются. Дополнительно:
 
 | Поле | Тип   | Обязательное |
 |------|--------|--------------|
-| id   | string | нет         | Идентификатор пользователя для обновления |
+| id   | string | нет         | Идентификатор из входа; ID каталога сохраняется из его текущей формы |
 
 DTO: `UpdateUserDTO` (наследует CreateUserDTO, добавляет `id`).
 
@@ -50,7 +52,7 @@ DTO: `UpdateUserDTO` (наследует CreateUserDTO, добавляет `id`)
 | oldReg      | string | да          |
 | companyName | string | да          |
 
-DTO: `EnableRegCompanyDTO` (services/reg_company_service/dto.py). Пока только приём и лог; реализация API — позже.
+DTO: `EnableRegCompanyDTO` (services/reg_company_service/dto.py). Операция пока не реализована: событие после проверки формата отправляется в `reg-company-dlq` с кодом `NOT_IMPLEMENTED`.
 
 ---
 
@@ -64,7 +66,7 @@ DTO: `EnableRegCompanyDTO` (services/reg_company_service/dto.py). Пока то�
 | reg         | string | да          |
 | companyName | string | да          |
 
-DTO: `DisableRegCompanyDTO`. Пока только приём и лог.
+DTO: `DisableRegCompanyDTO`. Операция пока не реализована: событие после проверки формата отправляется в `reg-company-dlq` с кодом `NOT_IMPLEMENTED`.
 
 ---
 
@@ -77,9 +79,9 @@ DTO: `DisableRegCompanyDTO`. Пока только приём и лог.
 |-------------|--------|--------------|
 | reg         | string | да          |
 | id          | string | да          |
-| departments | array  | да, не пустой |
+| departments | array  | да, может быть пустым |
 
-Элемент `departments`: `{ "id": string, "title": string }`.
+Элемент `departments`: `{ "id": string, "title": string }`. `id` сопоставляется с UUID отдела компании и подтверждённым ID группы каталога. Пользовательский поток сам группы не создаёт. Пустой список снимает только известные назначения интеграции; ручные группы сохраняются.
 
 DTO: `UpdateUserDepartmentsDTO`, `DepartmentDTO` (id, title).
 
@@ -97,7 +99,8 @@ DTO: `UpdateUserDepartmentsDTO`, `DepartmentDTO` (id, title).
 | id          | number | да          | ID компании (client_id) |
 | reg         | string | да          | Рег. номер |
 | companyName | string | нет         | Для `sync_departments` часто не передаётся (по умолчанию "") |
-| departments | array  | нет (по умолчанию []) | Список отделов |
+| departments | array  | да | Полный снимок отделов; пропущенное поле отклоняется |
+| allow_empty_snapshot | boolean | нет | `true` разрешает пустым снимком архивировать существующие отделы |
 
 Элемент `departments`: `{ "id": string (UUID, обязателен), "title": string, "modules": [string, ...] }`.  
 `id` — UUID отдела (обязателен для каждого элемента); `title` — название группы в каталоге; `modules` — названия кабинетов (инфобордов). При отсутствии `id` в логах выводится сообщение «В отделе отсутствует id».

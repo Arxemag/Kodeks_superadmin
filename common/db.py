@@ -91,3 +91,23 @@ async def shutdown_db() -> None:
     _engine = None
     _sessionmaker = None
 
+
+async def healthcheck_schema() -> None:
+    """Check the actual application tables, not merely a PostgreSQL socket."""
+    settings = get_settings()
+    try:
+        async with get_db_session() as session:
+            await session.execute(text(
+                f"SELECT reg_number, base_url FROM {settings.DB_TABLE_REG_SERVICES} LIMIT 0"
+            ))
+            await session.execute(text(
+                f"SELECT department_id, service_group_name, reg, client_id, client_name, mapping_status, catalog_group_id, catalog_group_name, catalog_group_origin, catalog_group_rename_allowed "
+                f"FROM {settings.DB_TABLE_DEPARTMENT_MAPPING} LIMIT 0"
+            ))
+            await session.execute(text("SELECT reg, user_uid, group_ids FROM catalog_user_group_ownership LIMIT 0"))
+            await session.execute(text("SELECT id, status, payload, available_at FROM integration_events LIMIT 0"))
+            await session.execute(text("SELECT id, payload, sent_at FROM integration_outbox LIMIT 0"))
+            await session.execute(text("SELECT catalog_url, reg, control_name, group_ids FROM catalog_acl_ownership LIMIT 0"))
+    except Exception as error:
+        raise DatabaseError(code="DB_SCHEMA_NOT_READY", message="Application tables are not ready", http_status=503) from error
+

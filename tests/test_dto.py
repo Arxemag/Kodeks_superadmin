@@ -67,12 +67,9 @@ def test_update_user_departments_dto() -> None:
     assert d.departments[0].title == "Group A"
 
 
-def test_update_user_departments_empty_invalid() -> None:
-    with pytest.raises(ValidationError):
-        UpdateUserDepartmentsDTO.model_validate({
-            "reg": "1", "id": "u",
-            "departments": [],
-        })
+def test_update_user_departments_empty_means_clear_managed_assignments() -> None:
+    dto = UpdateUserDepartmentsDTO.model_validate({"reg": "1", "id": "u", "departments": []})
+    assert dto.departments == []
 
 
 def test_redact_payload() -> None:

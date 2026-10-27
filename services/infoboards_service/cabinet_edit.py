@@ -245,7 +245,12 @@ async def set_widgets(
         "set_widgets board_id=%r widgets_count=%s headers=%s",
         board.id, len(widget_inputs), [w.get("header") for w in widget_inputs],
     )
-    await _graphql(base_url, client, cookies, MUTATION_EDIT_CONFIG, {"ConfigInput": config_input})
+    try:
+        await _graphql(base_url, client, cookies, MUTATION_EDIT_CONFIG, {"ConfigInput": config_input})
+    except (NetworkError, ParseError) as error:
+        # A mutation may have reached the catalog even if its reply failed.
+        # The caller must reconcile before trying this full replacement again.
+        raise ParseError(code="WIDGET_WRITE_UNCERTAIN", message=f"Widget write outcome is unknown for {board.id!r}") from error
 
 
 # --- Опросник -> чистка под-кабинетов -------------------------------------------------
@@ -320,11 +325,16 @@ async def crawl_boards(
         board_id, depth, link_header = queue.popleft()
         try:
             board = await fetch_board(base_url, client, cookies, board_id)
-        except (ParseError, NetworkError) as e:
-            # Битая/недоступная ссылка на под-кабинет (борда нет -> 404 GRAPHQL_4XX,
-            # либо BOARD_NOT_FOUND, либо таймаут) НЕ должна ронять весь обход — пропускаем борд.
+        except ParseError as e:
             logger.warning("crawl: борд %r пропущен (%s)", board_id, getattr(e, "code", e))
             continue
+        except NetworkError as e:
+            # Preserve the existing release fix for a link to a missing board.
+            # A timeout or a temporary catalog outage must still be retried.
+            if e.code == "GRAPHQL_4XX" and "status=404" in e.message:
+                logger.warning("crawl: отсутствующий борд %r пропущен", board_id)
+                continue
+            raise
         boards[board_id] = board
         _index(link_header, board_id)
         _index(board.title, board_id)
@@ -407,6 +417,7 @@ async def correct_cabinet(
     )
 
     plans: list[QuestionPlan] = []
+    pending_removals: dict[str, set[str]] = {}
     for q in questions:
         question = str(q.get("question") or "")
         answers = list(q.get("answers") or [])
@@ -434,6 +445,9 @@ async def correct_cabinet(
         sub_id = matches[0]
         sub = boards[sub_id]
         selected = {_norm(a) for a in answers if _norm(a) != _norm(SELECT_ALL)}
+        unknown = selected - {_norm(answer) for answer in m["answers"]}
+        if unknown:
+            raise ParseError(code="UNKNOWN_QUESTIONNAIRE_ANSWER", message=f"Unknown answer for question {question!r}")
         # к удалению — заголовки виджетов НЕвыбранных вариантов (из справочника)
         delete_headers = {
             _norm(header) for opt, header in m["answers"].items()
@@ -450,12 +464,32 @@ async def correct_cabinet(
                 keep.append(w.get("header"))
         plans.append(QuestionPlan(question, "prune", sub_id, keep, delete))
         logger.info("Q %r -> sub=%s(%r) delete=%s", question[:60], sub_id, sub.title, delete)
-        if not dry_run and delete:
+        if delete:
+            pending_removals.setdefault(sub_id, set()).update(delete_headers)
+
+    invalid = [plan for plan in plans if plan.action in {"unknown-question", "no-sub", "ambiguous"}]
+    if invalid:
+        raise ParseError(
+            code="CABINET_PLAN_INVALID",
+            message=f"Cannot resolve all questionnaire targets: {[plan.action for plan in invalid]}",
+        )
+
+    # Validate every question before making the first full configuration write.
+    if not dry_run:
+        for sub_id, delete_headers in pending_removals.items():
+            sub = boards[sub_id]
             kept_widgets = [
                 w for w in sub.widgets
                 if _norm(w.get("header")) in SYSTEM_KEEP or _norm(w.get("header")) not in delete_headers
             ]
-            await set_widgets(base_url, client, cookies, sub, widgets_to_input(kept_widgets))
+            expected = widgets_to_input(kept_widgets)
+            await set_widgets(base_url, client, cookies, sub, expected)
+            try:
+                actual = await fetch_board(base_url, client, cookies, sub_id)
+            except (NetworkError, ParseError) as error:
+                raise ParseError(code="WIDGET_WRITE_UNCERTAIN", message=f"Widget write could not be verified for {sub_id!r}") from error
+            if widgets_to_input(actual.widgets) != expected:
+                raise ParseError(code="CABINET_WRITE_NOT_CONFIRMED", message=f"Widget configuration was not applied for {sub_id!r}")
     return plans
 
 

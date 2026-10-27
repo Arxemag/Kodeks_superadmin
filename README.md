@@ -1,12 +1,12 @@
 # Kodeks superadmin
 
-Auth API и Kafka-воркеры для каталога Кодекс: пользователи, init_company, enable/disable reg company.
+Auth API и Kafka-воркер для каталога Кодекс: пользователи, отделы, права и уточнение кабинетов. Обработчики enable/disable reg company пока не реализуют действие и отправляют события с кодом `NOT_IMPLEMENTED` в DLQ.
 
 ---
 
 ## Деплой на сервер (для DevOps)
 
-**Что поднять:** два контейнера (или два процесса): **auth-api** и **worker**. Один Docker-образ, в `docker-compose` выбор через `command`.
+**Что поднять:** два процесса приложения — **auth-api** и **worker** — и отдельный Chromium для браузерных форм каталога. Контейнеры приложения используют один Docker-образ; процесс выбирается через `command`.
 
 ### Перед первым запуском
 
@@ -27,10 +27,10 @@ Auth API и Kafka-воркеры для каталога Кодекс: поль�
 
    Для доступа снаружи обычно пробрасывают только порт API (8000). Порт 9100 — для Prometheus/мониторинга.
 
-4. **Зависимости до старта:** PostgreSQL и Kafka должны быть доступны по адресам из `.env`. В БД должны быть созданы таблицы до первого запуска: `python scripts/init_db.py` (подробнее — раздел [БД](#бд) ниже: какие таблицы и колонки нужны). Иначе контейнеры падают при подключении (при `restart: unless-stopped` будут перезапускаться).
+4. **Зависимости до старта:** PostgreSQL и Kafka должны быть доступны по адресам из `.env`. До запуска API и worker выполните миграции `python -m scripts.init_db` из корня проекта или командой Docker ниже. Подробности и порядок перехода с предыдущей версии — в [инструкции выкладки](docs/PRODUCTION_RUNBOOK.md).
 
 5. **Проверка после деплоя:**
-   - Auth API: `curl http://<хост>:8000/api/expert/health` → `{"status":"ok"}`.
+   - Auth API: `curl --fail http://<хост>:8000/api/expert/ready` → `{"status":"ok"}`; этот ответ проверяет схему БД, но не работу каталога.
    - Метрики воркера: `curl http://<хост>:9100/metrics` (если порт проброшен).
 
 6. **Логи:** всё пишется в stdout/stderr. Уровень — `LOG_LEVEL` в `.env` (по умолчанию `INFO`).
@@ -39,10 +39,11 @@ Auth API и Kafka-воркеры для каталога Кодекс: поль�
 
 ```bash
 docker compose build
-docker compose up -d
+docker compose run --rm --no-deps auth-api python -m scripts.init_db
+docker compose up -d chromium auth-api
 ```
 
-Поднятся оба сервиса: `auth-api` и `worker`. Только API без воркера: `docker compose up -d auth-api`. БД поднимается отдельно; в `.env` для Docker укажите хост БД: **имя контейнера** с PostgreSQL (если БД в Docker) или `host.docker.internal` (если БД на хосте), не `localhost`.
+После проверки каталога на сервере согласно [инструкции выкладки](docs/PRODUCTION_RUNBOOK.md) поток включается командой `docker compose up -d worker`. БД поднимается отдельно; в `.env` для Docker укажите хост БД: **имя контейнера** с PostgreSQL (если БД в Docker) или `host.docker.internal` (если БД на хосте), не `localhost`.
 
 ### Если БД и Kafka на хосте, а не в Docker
 
@@ -88,11 +89,11 @@ python main.py
 python main_unified_worker.py
 ```
 
-Отдельные воркеры (если нужны): `python main_users.py`, `python main_init_company.py`, `python main_reg_company.py` — в этом случае в `.env` задать отдельные группы (`KAFKA_GROUP_ID`, `KAFKA_INIT_COMPANY_GROUP_ID`, `KAFKA_REG_COMPANY_GROUP_ID`).
+Отдельные воркеры сохранены для совместимости. Они не используют долговечный журнал единого worker и не предназначены для одновременного запуска с ним.
 
 ## Docker (сводка)
 
-Один образ, в `docker-compose` два сервиса: **auth-api** и **worker**.
+Один образ приложения для сервисов **auth-api** и **worker**, плюс отдельный сервис **chromium**.
 
 | Сервис   | Команда                      | Порт (по умолчанию) |
 |----------|------------------------------|----------------------|
@@ -122,7 +123,7 @@ python main_unified_worker.py
 - Маршрутизация по эффективному топику (`event_type` из сообщения или `record.topic`), обработчики: users, init_company (в т.ч. sync_departments), reg_company, correct-cabinet
 - Метрики на `UNIFIED_WORKER_METRICS_PORT` (9100)
 
-Отдельные воркеры (`main_users.py`, `main_init_company.py`, `main_reg_company.py`) по-прежнему в репозитории — можно запускать их вместо единого, с разными группами (KAFKA_GROUP_ID, KAFKA_INIT_COMPANY_GROUP_ID, KAFKA_REG_COMPANY_GROUP_ID).
+Отдельные воркеры (`main_users.py`, `main_init_company.py`, `main_reg_company.py`) сохранены как legacy и не используют долговечный журнал единого worker. Для промышленного потока используется только единый worker; не запускать оба поколения одновременно.
 
 ## Уточнение кабинета (correct-cabinet)
 
@@ -155,7 +156,7 @@ python main_unified_worker.py
    - `ADMIN_LOGIN`, `ADMIN_PASSWORD` — админ каталога (под ним правятся виджеты).
    - Имена топиков менять только если у фронта другие (по умолчанию уже заданы):
      `KAFKA_CORRECT_CABINET_TOPIC=correct-cabinet`, `KAFKA_CABINET_CORRECTED_TOPIC=cabinet-corrected`, `KAFKA_CORRECT_CABINET_DLQ_TOPIC=correct-cabinet-dlq`.
-   - **`CORRECT_CABINET_DRY_RUN=true`** — для безопасного первого запуска: воркер принимает сообщения, пишет план в лог и отвечает в `cabinet-corrected`, но **виджеты не удаляет**. Убедились по логам, что план верный → ставим `false` (боевой режим).
+   - **`CORRECT_CABINET_DRY_RUN=true`** — воркер принимает сообщения и пишет план в лог, но не изменяет виджеты и не отправляет ответ в `cabinet-corrected`. Потреблённое событие автоматически не выполняется повторно при переключении в `false`; для реального изменения нужна отдельная согласованная повторная отправка.
    - (опц.) `CORRECT_CABINET_METRICS_PORT` (9104) — только если запускать отдельным процессом; в едином воркере не нужен.
 3. **Сеть:** процесс-воркер должен дотягиваться до каталога (`base_url`, HTTPS, TLS-серт должен быть валиден) и до БД (`reg_services`). Для внутренних хостов каталога — соответствующий VPN/доступ на сервере.
 4. **Справочник** `services/infoboards_service/ecology_questionnaire_map.json` поставляется с кодом и грузится автоматически (ничего отдельно класть не нужно). При изменении набора/названий виджетов в каталоге — перегенерировать запрос (`scripts/gen_widget_query.py`) и сверить справочник.

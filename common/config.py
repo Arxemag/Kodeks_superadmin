@@ -12,6 +12,7 @@ from functools import lru_cache
 
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy.engine import URL
 
 from common.exceptions import ConfigError
 
@@ -48,6 +49,7 @@ class Settings(BaseSettings):
     ADMIN_PASSWORD: str = Field(..., description="Catalog admin password")
 
     HTTP_TIMEOUT: float = Field(10.0, description="HTTP timeout seconds")
+    CATALOG_LOCK_TIMEOUT: float = Field(30.0, gt=0, description="Catalog database lock wait timeout seconds")
     LOG_LEVEL: str = Field("INFO", description="Log level")
     CHROMIUM_WS_ENDPOINT: str = Field(
         "",
@@ -127,7 +129,10 @@ class Settings(BaseSettings):
         description="Если true — correct_cabinet только логирует план (без удаления виджетов). Для безопасного первого прогона.",
     )
 
-    # --- Reg company (enable/disable) Kafka worker — пока только приём и лог ---
+    # --- Reg company: unsupported actions are retained in DLQ ---
+    KAFKA_REG_COMPANY_DLQ_TOPIC: str = Field(
+        "reg-company-dlq", description="DLQ for unsupported or invalid registration actions",
+    )
     KAFKA_ENABLE_REG_COMPANY_TOPIC: str = Field(
         "enable_reg_company",
         description="Kafka topic: включение рега (reg, oldReg, companyName)",
@@ -151,8 +156,19 @@ class Settings(BaseSettings):
         description="Prometheus metrics port for unified Kafka worker",
     )
 
+    # Durable unified-worker intake/execution. Standalone workers are legacy.
+    INTEGRATION_SOURCE_NAMESPACE: str = Field("kodeks-platform", min_length=1)
+    INTEGRATION_EXECUTOR_CONCURRENCY: int = Field(2, ge=1, le=4)
+    INTEGRATION_MAX_PENDING: int = Field(10000, ge=1)
+    INTEGRATION_POLL_SECONDS: float = Field(0.5, gt=0)
+    INTEGRATION_RETRY_ATTEMPTS: int = Field(5, ge=1)
+    INTEGRATION_RETRY_BASE_SECONDS: float = Field(1.0, gt=0)
+    INTEGRATION_RETRY_MAX_SECONDS: float = Field(60.0, gt=0)
+    INTEGRATION_EVENT_DEADLINE_SECONDS: float = Field(3600.0, gt=0)
+    INTEGRATION_SHUTDOWN_SECONDS: float = Field(30.0, gt=0)
+
     # Жёсткий таймаут на операцию логина (секунды).
-    AUTH_HARD_TIMEOUT: float = Field(2.0, description="Hard timeout for auth/login operation seconds")
+    AUTH_HARD_TIMEOUT: float = Field(30.0, gt=0, description="Hard timeout for auth/login operation seconds")
     AUTH_HARD_TIMEOUT_DEBUG: float = Field(
         20.0,
         description="Hard timeout for auth/login operation in DEBUG (seconds)",
@@ -170,10 +186,10 @@ class Settings(BaseSettings):
         if not self.DB_URL:
             parts = [self.PG_HOST, self.PG_USERNAME, self.PG_PASSWORD, self.PG_DATABASE]
             if all(parts):
-                self.DB_URL = (
-                    f"postgresql+asyncpg://{self.PG_USERNAME}:{self.PG_PASSWORD}"
-                    f"@{self.PG_HOST}:{self.PG_PORT}/{self.PG_DATABASE}"
-                )
+                self.DB_URL = URL.create(
+                    "postgresql+asyncpg", username=self.PG_USERNAME, password=self.PG_PASSWORD,
+                    host=self.PG_HOST, port=self.PG_PORT, database=self.PG_DATABASE,
+                ).render_as_string(hide_password=False)
         if not (self.DB_URL or "").strip():
             raise ValueError(
                 "DB_URL is empty; set DB_URL or all of PG_HOST, PG_USERNAME, PG_PASSWORD, PG_DATABASE"

@@ -93,6 +93,20 @@ def test_metrics(auth_client: TestClient) -> None:
     assert "text/plain" in r.headers.get("content-type", "")
 
 
+def test_liveness_does_not_require_the_database(auth_client: TestClient) -> None:
+    with patch('services.auth_service.app.healthcheck_schema', side_effect=AssertionError('must not be called')):
+        assert auth_client.get('/api/expert/live').status_code == 200
+
+
+def test_readiness_requires_migrated_schema(auth_client: TestClient) -> None:
+    from common.exceptions import DatabaseError
+    with patch('services.auth_service.app.healthcheck_schema', new_callable=AsyncMock) as check:
+        check.side_effect = DatabaseError(code='DB_SCHEMA_NOT_READY', message='schema missing', http_status=503)
+        response = auth_client.get('/api/expert/ready')
+        assert response.status_code == 503
+        check.assert_awaited_once()
+
+
 # Рег, которого нет в БД (в реальной базе есть, например, 350832).
 REG_NOT_IN_DB = "999999"
 

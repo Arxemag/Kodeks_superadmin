@@ -54,8 +54,6 @@ class AuthService:
         auth_requests_total.labels(mode=mode).inc()
 
         hard_timeout = self.settings.AUTH_HARD_TIMEOUT
-        if self.settings.LOG_LEVEL.upper() == "DEBUG":
-            hard_timeout = self.settings.AUTH_HARD_TIMEOUT_DEBUG
 
         start = time.perf_counter()
         try:

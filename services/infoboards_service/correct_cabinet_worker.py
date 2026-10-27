@@ -15,6 +15,7 @@ import asyncio
 import random
 import signal
 from datetime import datetime, timezone
+from functools import partial
 from typing import Any
 
 import httpx
@@ -23,9 +24,13 @@ from aiokafka.structs import ConsumerRecord, OffsetAndMetadata
 from pydantic import ValidationError
 
 from common.config import get_settings
+from common.catalog_lock import catalog_operation
 from common.exceptions import AuthError, NetworkError, ParseError
 from common.http import _default_headers
-from common.kafka import create_consumer, create_producer, unwrap_payload
+from common.kafka import (
+    MalformedJSON, create_consumer, create_producer, unwrap_payload,
+    dlq_payload, ensure_partition_assigned, get_assignment_epoch, process_partition_batch, record_coordinates,
+)
 from common.logger import get_logger, set_trace_id
 from services.auth_service.service import AuthService
 from services.infoboards_service.cabinet_edit import correct_cabinet, load_questionnaire_map
@@ -41,9 +46,10 @@ def _backoff(attempt: int, settings: Any) -> float:
     return exp + random.uniform(0, exp * 0.25)
 
 
-async def _send_dlq(producer: AIOKafkaProducer, topic: str, payload: Any, code: str, message: str) -> None:
+async def _send_dlq(producer: AIOKafkaProducer, topic: str, payload: Any, code: str, message: str, *, source_record=None) -> None:
     await producer.send_and_wait(topic, {
-        "original_message": payload,
+        "original_message": dlq_payload(payload),
+        **record_coordinates(source_record),
         "error_code": code,
         "error_message": message,
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -59,17 +65,21 @@ async def _handle_with_retries(
     settings: Any,
 ) -> None:
     """Валидация, обработка correct_cabinet, ответ в cabinet-corrected; retry/DLQ при ошибках."""
+    send_dlq = partial(_send_dlq, source_record=record)
     dlq = settings.KAFKA_CORRECT_CABINET_DLQ_TOPIC
     payload = unwrap_payload(record.value)
+    if isinstance(payload, MalformedJSON):
+        await send_dlq(producer, dlq, payload, "INVALID_JSON", payload.error)
+        return
     if not isinstance(payload, dict):
-        await _send_dlq(producer, dlq, payload, "INVALID_PAYLOAD", "Payload is not an object")
+        await send_dlq(producer, dlq, payload, "INVALID_PAYLOAD", "Payload is not an object")
         return
 
     set_trace_id(f"correct_cabinet-{record.topic}-{record.partition}-{record.offset}")
     try:
         dto = CorrectCabinetDTO.model_validate(payload)
     except ValidationError as e:
-        await _send_dlq(producer, dlq, payload, "VALIDATION_ERROR", str(e))
+        await send_dlq(producer, dlq, payload, "VALIDATION_ERROR", str(e))
         return
 
     logger.info(
@@ -78,43 +88,64 @@ async def _handle_with_retries(
     )
 
     attempts = settings.USERS_RETRY_ATTEMPTS
+    if attempts < 1:
+        raise RuntimeError("Retry attempts must be at least one")
     for attempt in range(1, attempts + 1):
         try:
             base_url = await resolver.resolve_base_url(dto.reg)
-            async with resolver.with_session() as session:
-                cookies = await AuthService(db=session, settings=settings).login(reg=dto.reg, name=None)
-            dry_run = bool(getattr(settings, "CORRECT_CABINET_DRY_RUN", False))
-            plans = await correct_cabinet(
-                base_url, http_client, cookies, dto.link,
-                [q.model_dump() for q in dto.questions],
-                dry_run=dry_run,
-            )
+            async with catalog_operation(base_url):
+                async with resolver.with_session() as session:
+                    cookies = await AuthService(db=session, settings=settings).login(reg=dto.reg, name=None)
+                dry_run = bool(getattr(settings, "CORRECT_CABINET_DRY_RUN", False))
+                plans = await correct_cabinet(
+                    base_url, http_client, cookies, dto.link,
+                    [q.model_dump() for q in dto.questions],
+                    dry_run=dry_run,
+                )
             if dry_run:
                 logger.warning("CORRECT_CABINET_DRY_RUN=true — виджеты НЕ удалялись (только план)")
-            await producer.send_and_wait(settings.KAFKA_CABINET_CORRECTED_TOPIC, {
+                logger.info("correct_cabinet dry-run plans=%s", [(p.action, p.sub_id, len(p.delete_headers)) for p in plans])
+                return
+            result = {
                 "userId": dto.userId,
                 "reg": dto.reg,
                 "oldLink": dto.link,
                 "link": dto.link,
-            })
+            }
             logger.info(
                 "correct_cabinet done reg=%r plans=%s",
                 dto.reg, [(p.action, p.sub_id, len(p.delete_headers)) for p in plans],
             )
-            return
+            break
         except (ParseError, ValueError) as e:
-            await _send_dlq(producer, dlq, payload, "VALIDATION_ERROR", str(e))
+            await send_dlq(producer, dlq, payload, e.code if isinstance(e, ParseError) else "VALIDATION_ERROR", str(e))
             return
         except AuthError as e:
             if e.code == "REG_NOT_FOUND" or attempt == attempts:
-                await _send_dlq(producer, dlq, payload, e.code, e.message)
+                await send_dlq(producer, dlq, payload, e.code, e.message)
                 return
             await asyncio.sleep(_backoff(attempt, settings))
         except NetworkError as e:
             if attempt == attempts:
-                await _send_dlq(producer, dlq, payload, e.code, e.message)
+                await send_dlq(producer, dlq, payload, e.code, e.message)
                 return
             await asyncio.sleep(_backoff(attempt, settings))
+
+    else:
+        raise RuntimeError("No successful correct-cabinet attempt")
+
+    # Publishing is outside the catalog retry block: a Kafka delivery failure
+    # must not repeat the destructive catalog operation within this attempt.
+    await producer.send_and_wait(settings.KAFKA_CABINET_CORRECTED_TOPIC, result)
+
+
+async def _process_record(record, partition, *, resolver, http_client, producer, consumer, settings):
+    """A handler/DLQ failure is fatal before commit, never a logged success."""
+    epoch = get_assignment_epoch(consumer)
+    ensure_partition_assigned(consumer, partition, epoch)
+    await _handle_with_retries(record, resolver, http_client, producer, settings)
+    ensure_partition_assigned(consumer, partition, epoch)
+    await consumer.commit({partition: OffsetAndMetadata(record.offset + 1, "")})
 
 
 async def run_worker() -> None:
@@ -156,13 +187,15 @@ async def run_worker() -> None:
                 batch = await consumer.getmany(timeout_ms=settings.KAFKA_POLL_TIMEOUT_MS)
                 if not batch:
                     continue
-                for partition, records in batch.items():
-                    for record in records:
-                        try:
-                            await _handle_with_retries(record, resolver, http_client, producer, settings)
-                        except Exception as e:
-                            logger.exception("correct_cabinet unexpected error offset=%s err=%r", record.offset, e)
-                        await consumer.commit({partition: OffsetAndMetadata(record.offset + 1, "")})
+                batch_epoch = get_assignment_epoch(consumer)
+
+                async def process(partition, record):
+                    ensure_partition_assigned(consumer, partition, batch_epoch)
+                    await _process_record(
+                        record, partition, resolver=resolver, http_client=http_client,
+                        producer=producer, consumer=consumer, settings=settings,
+                    )
+                await process_partition_batch(batch, process)
         finally:
             await consumer.stop()
             await producer.stop()
