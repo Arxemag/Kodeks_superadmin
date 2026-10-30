@@ -260,8 +260,12 @@ class CatalogClient:
                 raise NetworkError(code="CATALOG_READ_FAILED", message="Cannot read group editing form") from error
             _check_response(response)
             pairs, action, method = parse_group_creation_details(response.text)
-            ids = [value for key, value in pairs if key == "gn"]
-            if method != "post" or ids != [str(group_id)]:
+            ids = [value for key, value in pairs if key == "grp"]
+            form_names = [value for key, value in pairs if key == "name"]
+            before_names = [name for name, existing_id in groups.items() if existing_id == group_id]
+            if (method != "post" or ids != [str(group_id)] or len(form_names) != 1
+                    or len(before_names) != 1
+                    or normalize_title(form_names[0]) != normalize_title(before_names[0])):
                 raise ParseError(code="GROUP_EDIT_FORM_INVALID", message="Group form does not confirm the bound group ID")
             pairs = [(key, value) for key, value in pairs if key != "name"] + [("name", title)]
             target = _form_target(page_url, action) if action else page_url

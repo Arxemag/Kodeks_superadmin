@@ -402,7 +402,7 @@ async def probe(profile):
                                 _check_response(response)
                                 target, pairs = delete_form(response.text, {"name", "gn"}, base, "/users/groups")
                                 require(any(key == "name" and value == group_title for key, value in pairs), "CLEANUP_GROUP_NAME_MISMATCH")
-                                require([value for key, value in pairs if key == "gn"] == [str(exact)], "CLEANUP_GROUP_ID_MISMATCH")
+                                require([value for key, value in pairs if key == "grp"] == [str(exact)], "CLEANUP_GROUP_ID_MISMATCH")
                                 await submit_delete(target, pairs)
                             require(group_title not in await groups(), "CLEANUP_GROUP_REMAINS")
 

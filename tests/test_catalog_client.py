@@ -278,3 +278,86 @@ async def test_server_error_on_read_is_retryable_not_uncertain_write():
         with pytest.raises(NetworkError) as error:
             await CatalogClient(http).get_groups_page(BASE, {})
     assert error.value.code == 'CATALOG_5XX'
+
+
+LIVE_GROUP_EDIT = '''<form action="../users/groups" method="POST">
+<input type="HIDDEN" name="grp" value="42"><input name="name" value="Original department">
+<input name="gn" value=""><input name="cmd" value=""><input name="csrf" value="proof">
+<input name="repeat" value="first"><input name="repeat" value="">
+<input type="SUBMIT" value="Установить"><input type="SUBMIT" name="del" value="Удалить">
+</form>'''
+
+
+@pytest.mark.asyncio
+async def test_rename_uses_live_hidden_grp_preserves_blank_gn_and_all_other_fields():
+    requests = []
+    saved = False
+
+    def respond(request):
+        nonlocal saved
+        requests.append(request)
+        if request.url.path == '/users/grp':
+            assert request.url.params['grp'] == '42'
+            return httpx.Response(200, text=LIVE_GROUP_EDIT)
+        assert request.url.path == '/users/groups'
+        if request.method == 'POST':
+            pairs = parse_qsl(request.content.decode(), keep_blank_values=True)
+            assert pairs == [('grp', '42'), ('gn', ''), ('cmd', ''), ('csrf', 'proof'),
+                             ('repeat', 'first'), ('repeat', ''), ('name', 'Renamed department')]
+            saved = True
+        title = 'Renamed department' if saved else 'Original department'
+        return httpx.Response(200, text=GROUP_INDEX + f'<a href="grp?grp=42">{title}</a>')
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as http:
+        client = CatalogClient(http)
+        await client.rename_group(BASE, 42, 'Renamed department', {})
+        await client.rename_group(BASE, 42, '  RENAMED   department ', {})
+    assert [(r.method, r.url.path) for r in requests] == [
+        ('GET', '/users/groups'), ('GET', '/users/grp'), ('POST', '/users/groups'),
+        ('GET', '/users/groups'), ('GET', '/users/groups')]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('form', [
+    LIVE_GROUP_EDIT.replace('name="grp" value="42"', 'name="grp" value="99"'),
+    LIVE_GROUP_EDIT.replace('<input type="HIDDEN" name="grp" value="42">', ''),
+    LIVE_GROUP_EDIT.replace('name="gn" value=""', 'name="gn" value="42"')
+                   .replace('name="grp" value="42"', 'name="grp" value="99"'),
+    LIVE_GROUP_EDIT.replace('name="name" value="Original department"', 'name="name" value="Another department"'),
+    LIVE_GROUP_EDIT.replace('method="POST"', 'method="GET"'),
+])
+async def test_rename_rejects_unconfirmed_edit_identity_before_writing(form):
+    requests = []
+
+    def respond(request):
+        requests.append(request)
+        if request.url.path == '/users/grp':
+            return httpx.Response(200, text=form)
+        return httpx.Response(200, text=GROUP_INDEX + '<a href="grp?grp=42">Original department</a>')
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as http:
+        with pytest.raises(ParseError) as error:
+            await CatalogClient(http).rename_group(BASE, 42, 'Renamed department', {})
+    assert error.value.code == 'GROUP_EDIT_FORM_INVALID'
+    assert all(r.method == 'GET' for r in requests)
+
+
+@pytest.mark.asyncio
+async def test_rename_is_not_confirmed_if_new_name_has_a_different_group_id():
+    posted = False
+
+    def respond(request):
+        nonlocal posted
+        if request.url.path == '/users/grp':
+            return httpx.Response(200, text=LIVE_GROUP_EDIT)
+        if request.method == 'POST':
+            posted = True
+        index = '<a href="grp?grp=42">Original department</a>'
+        if posted:
+            index += '<a href="grp?grp=99">Renamed department</a>'
+        return httpx.Response(200, text=GROUP_INDEX + index)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as http:
+        with pytest.raises(ParseError) as error:
+            await CatalogClient(http).rename_group(BASE, 42, 'Renamed department', {})
+    assert error.value.code == 'GROUP_RENAME_NOT_CONFIRMED'
