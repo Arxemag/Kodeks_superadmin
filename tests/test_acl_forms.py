@@ -128,6 +128,82 @@ def test_save_submitter_associated_by_form_id_is_included():
     assert ("apply", "Установить") in pairs
 
 
+def inactive_blank_page():
+    html = acl_page((), untouched=(7,), active=False)
+    return html.replace('value="{&quot;kw&quot;:[] }"', 'value=""')
+
+
+def test_blank_inactive_acl_is_preserved_through_parse_plan_build_and_verify():
+    from common.acl_ownership import plan_acl_assignments
+    from services.infoboards_service.admin_dirs import acl_values
+
+    html = inactive_blank_page()
+    pairs = parse_form_pairs(html, acl=True, include_save=True)
+    assert dict(pairs)["acl_infoboard_p1"] == ""
+    assert acl_values(pairs)["acl_infoboard_p1"] == {"kw": []}
+    current = {name: {int(group) for group in value["kw"]} for name, value in acl_values(pairs).items()}
+    overrides, owned = plan_acl_assignments(current, {}, {"acl_infoboard_p1": set()})
+    result = build_admin_dirs_form(pairs, {}, available_controls=acl_control_names(html), field_overrides=overrides)
+    assert dict(result)["acl_infoboard_p1"] == ""
+    assert dict(result)["acl_infoboard_p1_view"] == ""
+    assert owned == {}
+    assert [(k, v) for k, v in result if k == "repeat"] == [("repeat", "A"), ("repeat", "B")]
+    verify_acl_form(result, html)
+
+
+def test_explicit_assignment_initializes_only_target_blank_acl():
+    from services.infoboards_service.admin_dirs import acl_values
+
+    html = inactive_blank_page()
+    pairs = parse_form_pairs(html, acl=True, include_save=True)
+    result = build_admin_dirs_form(pairs, {}, available_controls=acl_control_names(html),
+                                  checkbox_values=acl_checkbox_values(html),
+                                  field_overrides={"acl_infoboard_p1": [3]})
+    assert acl_values(result)["acl_infoboard_p1"]["kw"] == ["3"]
+    assert dict(result)["infoboard_p1"] == "on"
+    assert dict(result)["acl_infoboard_p1_view"] == ""
+    assert "infoboard_p1_view" not in dict(result)
+    assert dict(result)["acl_infoboard_p2"] == dict(pairs)["acl_infoboard_p2"]
+    actual = html.replace('name="acl_infoboard_p1" value=""',
+                          'name="acl_infoboard_p1" value="{&quot;kw&quot;:[&quot;3&quot;]}"')
+    actual = actual.replace('name="infoboard_p1" >', 'name="infoboard_p1" checked>')
+    verify_acl_form(result, actual)
+
+
+@pytest.mark.parametrize("change", ["checked", "disabled", "missing", "text", "malformed"])
+def test_blank_acl_requires_real_enabled_unchecked_checkbox(change):
+    html = inactive_blank_page()
+    if change == "malformed":
+        html = html.replace('name="acl_infoboard_p1" value=""', 'name="acl_infoboard_p1" value="not-json"')
+    elif change == "missing":
+        html = html.replace('name="infoboard_p1"', 'name="unrelated_flag"')
+    elif change == "text":
+        html = html.replace('type=checkbox name="infoboard_p1"', 'type=text name="infoboard_p1"')
+    else:
+        html = html.replace('name="infoboard_p1" >', f'name="infoboard_p1" {change}>')
+    with pytest.raises(ParseError) as caught:
+        parse_form_pairs(html, acl=True)
+    assert caught.value.code == "ACL_FORM_INVALID"
+
+
+def test_blank_acl_without_dom_context_is_rejected():
+    from services.infoboards_service.admin_dirs import acl_values
+    with pytest.raises(ParseError):
+        acl_values([("acl_infoboard_p1", "")])
+
+
+def test_blank_and_json_empty_are_not_equivalent_when_verifying():
+    html = inactive_blank_page()
+    expected = parse_form_pairs(html, acl=True, include_save=True)
+    changed = html.replace('name="acl_infoboard_p1" value=""',
+                           'name="acl_infoboard_p1" value="{&quot;kw&quot;:[]}"')
+    with pytest.raises(ParseError) as caught:
+        verify_acl_form(expected, changed)
+    assert caught.value.code == "ACL_WRITE_NOT_CONFIRMED"
+    with pytest.raises(ParseError):
+        verify_acl_form(parse_form_pairs(changed, acl=True), html)
+
+
 @pytest.mark.parametrize("actual", [acl_page(), acl_page((3,), untouched=(9,)), acl_page((3,), active=False)])
 def test_verify_rejects_noop_unrelated_acl_change_or_missing_activation(actual):
     with pytest.raises(ParseError) as caught:

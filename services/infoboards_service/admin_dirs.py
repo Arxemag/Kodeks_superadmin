@@ -21,6 +21,17 @@ from common.exceptions import ParseError
 from services.users_service.html_parser import _Document, _ancestor, _disabled, _form_controls, _successful
 
 
+class _FormPairs(list):
+    """Successful pairs plus DOM evidence for blank, inactive ACL controls.
+
+    Unchecked checkboxes are absent from URL-encoded pairs. Retain their proven
+    presence without inventing a field or changing the transmitted values.
+    """
+    def __init__(self, pairs=(), *, inactive_blank_fields=()):
+        super().__init__(pairs)
+        self.inactive_blank_fields = frozenset(inactive_blank_fields)
+
+
 def _read_form(html: str, *, required_names: set[str] | None = None, acl: bool = False):
     """Read one identifiable form using browser successful-control semantics.
 
@@ -66,6 +77,18 @@ def parse_form_pairs(html: str, *, required_names: set[str] | None = None, acl: 
         if submitter.attrs.get("name"):
             pairs.append((submitter.attrs["name"], submitter.attrs.get("value") or ""))
     if acl:
+        inactive_blanks = set()
+        for name, value in pairs:
+            if not name.startswith("acl_infoboard_") or value != "":
+                continue
+            flag = name.removeprefix("acl_")
+            flags = [node for node in controls if node.attrs.get("name") == flag]
+            if len(flags) == 1:
+                checkbox = flags[0]
+                if (checkbox.tag == "input" and checkbox.attrs.get("type", "").lower() == "checkbox"
+                        and not _disabled(checkbox) and "checked" not in checkbox.attrs):
+                    inactive_blanks.add(name)
+        pairs = _FormPairs(pairs, inactive_blank_fields=inactive_blanks)
         acl_values(pairs)
     return pairs
 
@@ -103,13 +126,19 @@ def setup_form_pairs(html: str) -> list[tuple[str, str]]:
 
 
 def acl_values(pairs: list[tuple[str, str]]) -> dict[str, dict]:
-    """Validate ACL JSON rather than interpreting malformed values as no rights."""
+    """Validate JSON, or a blank with a proven unchecked activation checkbox."""
     result = {}
+    raw_values = {}
+    inactive_blanks = getattr(pairs, "inactive_blank_fields", frozenset())
+    submitted_names = {name for name, _ in pairs}
     for name, value in pairs:
         if not name.startswith("acl_infoboard_"):
             continue
         try:
-            parsed = json.loads(value)
+            if value == "" and name in inactive_blanks and name.removeprefix("acl_") not in submitted_names:
+                parsed = {"kw": []}
+            else:
+                parsed = json.loads(value)
             if not isinstance(parsed, dict) or not isinstance(parsed.get("kw"), list):
                 raise ValueError
             if any(not str(group).isdigit() for group in parsed["kw"]):
@@ -118,7 +147,10 @@ def acl_values(pairs: list[tuple[str, str]]) -> dict[str, dict]:
             raise ParseError(code="ACL_FORM_INVALID", message=f"Invalid ACL field {name!r}") from error
         if name in result and result[name] != parsed:
             raise ParseError(code="ACL_FORM_INVALID", message=f"Conflicting repeated ACL field {name!r}")
+        if name in raw_values and (value == "" or raw_values[name] == "") and value != raw_values[name]:
+            raise ParseError(code="ACL_FORM_INVALID", message=f"Conflicting repeated ACL field {name!r}")
         result[name] = parsed
+        raw_values[name] = value
     if not result:
         raise ParseError(code="ACL_FORM_UNRECOGNIZED", message="Administrative form contains no ACL fields")
     return result
@@ -129,8 +161,11 @@ def verify_acl_form(expected: list[tuple[str, str]], actual_html: str) -> None:
     actual_pairs = parse_form_pairs(actual_html, acl=True)
     expected_acl = acl_values(expected)
     actual_acl = acl_values(actual_pairs)
+    expected_raw, actual_raw = dict(expected), dict(actual_pairs)
     for name, value in expected_acl.items():
         actual = actual_acl.get(name)
+        if (expected_raw.get(name) == "" or actual_raw.get(name) == "") and expected_raw.get(name) != actual_raw.get(name):
+            raise ParseError(code="ACL_WRITE_NOT_CONFIRMED", message=f"Fresh catalog form does not preserve blank ACL field {name!r}")
         if actual is None or {int(g) for g in actual["kw"]} != {int(g) for g in value["kw"]} or {k: v for k, v in actual.items() if k != "kw"} != {k: v for k, v in value.items() if k != "kw"}:
             raise ParseError(code="ACL_WRITE_NOT_CONFIRMED", message=f"Fresh catalog form does not confirm ACL field {name!r}")
     expected_flags = {name for name, _ in expected if name.startswith("infoboard_")}
@@ -270,8 +305,10 @@ def build_admin_dirs_form(
     controls absent from the live form. Unchecked controls can be enabled only
     when their existence was confirmed by the complete DOM parser.
     """
-    pairs = list(full_form.items()) if isinstance(full_form, dict) else list(full_form)
+    pairs = list(full_form.items()) if isinstance(full_form, dict) else _FormPairs(
+        full_form, inactive_blank_fields=getattr(full_form, "inactive_blank_fields", ()))
     existing_acl = acl_values(pairs)
+    raw_acl = dict(pairs)
     controls = available_controls if available_controls is not None else {key for key, _ in pairs}
     overrides = {}
     desired_fields = {}
@@ -289,11 +326,14 @@ def build_admin_dirs_form(
             raise ParseError(code="ACL_BOARD_NOT_FOUND", message=f"Required board ACL control is absent: {name!r}")
         value = dict(existing_acl[name])
         value["kw"] = [str(group) for group in dict.fromkeys(groups)]
-        overrides[name] = json.dumps(value, separators=(",", ":"))
+        overrides[name] = "" if raw_acl.get(name) == "" and not groups else json.dumps(value, separators=(",", ":"))
         flag_name = name.removeprefix("acl_")
         if flag_name in controls:
             overrides[flag_name] = (checkbox_values or dict(pairs)).get(flag_name, "on") if groups else None
     result = [(name, overrides.get(name, value)) for name, value in pairs if name not in overrides or overrides[name] is not None]
     present = {name for name, _ in pairs}
     result.extend((name, value) for name, value in overrides.items() if name not in present and value is not None)
-    return result
+    return _FormPairs(result, inactive_blank_fields={
+        name for name in getattr(pairs, "inactive_blank_fields", ())
+        if any(key == name and value == "" for key, value in result)
+    })
