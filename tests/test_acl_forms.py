@@ -200,8 +200,46 @@ def test_blank_and_json_empty_are_not_equivalent_when_verifying():
     with pytest.raises(ParseError) as caught:
         verify_acl_form(expected, changed)
     assert caught.value.code == "ACL_WRITE_NOT_CONFIRMED"
-    with pytest.raises(ParseError):
-        verify_acl_form(parse_form_pairs(changed, acl=True), html)
+    # An explicit empty grant is canonicalized by the catalog to inactive blank.
+    verify_acl_form(parse_form_pairs(changed, acl=True), html)
+
+
+def test_explicit_revoke_accepts_catalog_canonical_inactive_blank():
+    before = acl_page((3,))
+    expected = planned(before, [])
+    after = acl_page((), active=False).replace('value="{&quot;kw&quot;:[] }"', 'value=""')
+    for flag in ("infoboard_p2", "infoboard_p2_view"):
+        after = after.replace(f'name="{flag}" >', f'name="{flag}" checked>')
+    verify_acl_form(expected, after)
+
+
+def test_clear_canonicalization_does_not_drop_acl_metadata():
+    html = inactive_blank_page()
+    expected_html = html.replace('name="acl_infoboard_p1" value=""',
+                                'name="acl_infoboard_p1" value="{&quot;kw&quot;:[],&quot;scope&quot;:&quot;explicit&quot;}"')
+    with pytest.raises(ParseError) as caught:
+        verify_acl_form(parse_form_pairs(expected_html, acl=True), html)
+    assert caught.value.code == "ACL_WRITE_NOT_CONFIRMED"
+
+
+def test_clear_canonicalization_rejects_expected_active_checkbox():
+    html = inactive_blank_page()
+    expected_html = html.replace('name="acl_infoboard_p1" value=""',
+                                'name="acl_infoboard_p1" value="{&quot;kw&quot;:[]}"')
+    expected_html = expected_html.replace('name="infoboard_p1" >', 'name="infoboard_p1" checked>')
+    with pytest.raises(ParseError) as caught:
+        verify_acl_form(parse_form_pairs(expected_html, acl=True), html)
+    assert caught.value.code == "ACL_WRITE_NOT_CONFIRMED"
+
+
+def test_clear_canonicalization_rejects_actual_active_blank():
+    html = inactive_blank_page()
+    expected_html = html.replace('name="acl_infoboard_p1" value=""',
+                                'name="acl_infoboard_p1" value="{&quot;kw&quot;:[]}"')
+    actual = html.replace('name="infoboard_p1" >', 'name="infoboard_p1" checked>')
+    with pytest.raises(ParseError) as caught:
+        verify_acl_form(parse_form_pairs(expected_html, acl=True), actual)
+    assert caught.value.code == "ACL_FORM_INVALID"
 
 
 @pytest.mark.parametrize("actual", [acl_page(), acl_page((3,), untouched=(9,)), acl_page((3,), active=False)])

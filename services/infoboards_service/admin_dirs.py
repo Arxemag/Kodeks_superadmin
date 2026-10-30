@@ -164,7 +164,16 @@ def verify_acl_form(expected: list[tuple[str, str]], actual_html: str) -> None:
     expected_raw, actual_raw = dict(expected), dict(actual_pairs)
     for name, value in expected_acl.items():
         actual = actual_acl.get(name)
-        if (expected_raw.get(name) == "" or actual_raw.get(name) == "") and expected_raw.get(name) != actual_raw.get(name):
+        # The catalog canonicalizes an explicit empty grant to a blank only
+        # when its activation checkbox is off. This does not license dropping
+        # metadata or treating the reverse representation change as a no-op.
+        normalized_clear = (
+            value == {"kw": []} and expected_raw.get(name) != ""
+            and actual_raw.get(name) == ""
+            and name in getattr(actual_pairs, "inactive_blank_fields", ())
+            and name.removeprefix("acl_") not in expected_raw
+        )
+        if (expected_raw.get(name) == "" or actual_raw.get(name) == "") and expected_raw.get(name) != actual_raw.get(name) and not normalized_clear:
             raise ParseError(code="ACL_WRITE_NOT_CONFIRMED", message=f"Fresh catalog form does not preserve blank ACL field {name!r}")
         if actual is None or {int(g) for g in actual["kw"]} != {int(g) for g in value["kw"]} or {k: v for k, v in actual.items() if k != "kw"} != {k: v for k, v in value.items() if k != "kw"}:
             raise ParseError(code="ACL_WRITE_NOT_CONFIRMED", message=f"Fresh catalog form does not confirm ACL field {name!r}")
