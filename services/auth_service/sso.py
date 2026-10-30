@@ -1,6 +1,8 @@
 """Выдача одноразовой ссылки backend портала и вход браузера через nginx каталога."""
 from __future__ import annotations
 
+import base64
+import binascii
 import hmac
 import re
 import time
@@ -39,6 +41,28 @@ def valid_prepared_cookies(cookies: dict[str, str]) -> bool:
                 and not any(ord(c) < 32 or 127 <= ord(c) <= 159 for c in value)
                 for value in cookies.values())
     )
+
+
+def valid_auth_cookie(value: str | None) -> bool:
+    """Auth каталога передаётся точным ASCII base64, без кавычек и преобразований."""
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        return bool(base64.b64decode(value.encode("ascii"), validate=True))
+    except (UnicodeEncodeError, binascii.Error, ValueError):
+        return False
+
+
+def set_catalog_cookie(response: RedirectResponse, name: str, value: str, *, httponly: bool) -> None:
+    if name != "Auth":
+        response.set_cookie(name, value, path="/", secure=True, httponly=httponly, samesite="lax")
+        return
+    if not valid_auth_cookie(value):
+        raise ValueError("Invalid catalog Auth cookie")
+    # SimpleCookie quotes base64 padding '='; Chromium preserves those quotes
+    # as part of the cookie value. Base64 characters are valid cookie-octets.
+    attributes = "; Path=/; Secure" + ("; HttpOnly" if httponly else "") + "; SameSite=Lax"
+    response.raw_headers.append((b"set-cookie", ("Auth=" + value + attributes).encode("ascii")))
 
 
 def validate_local_path(path: str) -> str:
@@ -102,7 +126,7 @@ async def issue_ticket(payload: TicketRequest, request: Request,
         prepared = None
         if payload.cookies is not None:
             prepared = await auth.verify_sso_session(reg=payload.reg, name=payload.uid, cookies=payload.cookies)
-            if not prepared or not prepared.get("Auth", "").strip():
+            if not prepared or not valid_auth_cookie(prepared.get("Auth")):
                 return JSONResponse({"code": "SSO_SESSION_INVALID", "message": "Prepared session is invalid"}, 401, headers=_HEADERS)
         token = store.issue(reg=payload.reg, uid=payload.uid, path=path, base_url=base, cookies=prepared)
     except TicketStoreFull:
@@ -141,13 +165,12 @@ async def consume_ticket(request: Request, settings: Settings = Depends(enabled_
         if cookies is None:
             auth = AuthService(db, settings.model_copy(update={"AUTH_HARD_TIMEOUT": settings.SSO_LOGIN_TIMEOUT}))
             cookies = await auth.login_for_sso(reg=ticket.reg, name=ticket.uid)
-        if not cookies:
+        if not cookies or not valid_auth_cookie(cookies.get("Auth")):
             result = "auth_failed"
             return browser_error("SSO_AUTH_FAILED", 401)
         response = RedirectResponse(ticket.path, status_code=302, headers=_HEADERS)
         for name, value in cookies.items():
-            response.set_cookie(name, value, path="/", secure=True, httponly=settings.SSO_COOKIE_HTTPONLY,
-                                samesite="lax")
+            set_catalog_cookie(response, name, value, httponly=settings.SSO_COOKIE_HTTPONLY)
         result = "ok"
         return response
     except ServiceError as error:

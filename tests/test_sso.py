@@ -18,6 +18,9 @@ from services.auth_service.service import AuthService
 from services.auth_service.sso import router, get_ticket_store, validate_local_path
 from services.auth_service.sso_store import MemoryTicketStore, TicketStoreFull
 
+VALID_AUTH = "dGVzdC1sb2dpbjpwYXNzd29yZA=="
+PADDED_AUTH_WITH_SYMBOLS = "dGVzdHVzZXI64KC+4KC/YQ=="
+
 
 def settings(**changes):
     return Settings(_env_file=None, DB_URL="postgresql+asyncpg://stub/db", ADMIN_LOGIN="admin",
@@ -34,11 +37,11 @@ def setup_sso(monkeypatch):
     store = MemoryTicketStore()
     app.dependency_overrides[get_ticket_store] = lambda: store
     resolver = AsyncMock(return_value="https://cabinet-05.kodeks.expert")
-    login = AsyncMock(return_value={"Session": "session-value", "Other": "other-value"})
+    login = AsyncMock(return_value={"Auth": VALID_AUTH, "Other": "other-value"})
     monkeypatch.setattr(AuthService, "_get_base_url", resolver)
     monkeypatch.setattr(AuthService, "login_for_sso", login, raising=False)
     monkeypatch.setattr(AuthService, "verify_sso_session", AsyncMock(return_value={
-        "Auth": "verified-auth", "Kodeks": "verified-session", "KodeksData": "verified-data",
+        "Auth": VALID_AUTH, "Kodeks": "verified-session", "KodeksData": "verified-data",
     }), raising=False)
     # A fallback to the old admin-capable flow must never occur.
     old_login = AsyncMock(side_effect=AssertionError("Old auth flow called"))
@@ -100,7 +103,7 @@ def test_login_sets_host_only_cookies_and_consumes_ticket(setup_sso):
         assert response.headers["location"] == "/docs/?infoboard=P000A"
         cookies = response.headers.get_list("set-cookie")
         assert len(cookies) == 2
-        assert all("Secure" in c and "HttpOnly" in c and "SameSite=lax" in c and "Path=/" in c and "Domain=" not in c for c in cookies)
+        assert all("Secure" in c and "HttpOnly" in c and "samesite=lax" in c.lower() and "Path=/" in c and "Domain=" not in c for c in cookies)
         assert response.headers["cache-control"] == "no-store"
         assert response.headers["referrer-policy"] == "no-referrer"
         replay = client.get("/api/expert/sso", params={"ticket": body["ticket"]})
@@ -190,14 +193,14 @@ def test_prepared_session_is_verified_before_ticket_and_consumed_without_login(s
         issued = issue(client, cookies=prepared)
         assert issued.status_code == 200
         assert set(issued.json()) == {"ticket", "url", "expires_in"}
-        assert all(value not in issued.text for value in [*prepared.values(), "verified-auth", "verified-session", "verified-data"])
+        assert all(value not in issued.text for value in [*prepared.values(), VALID_AUTH, "verified-session", "verified-data"])
         verifier.assert_awaited_once_with(reg="465304", name="test-login", cookies=prepared)
         # Changes to the verifier's source dictionary cannot alter the ticket.
         verifier.return_value["Auth"] = "late-source-mutation"
         token = issued.json()["ticket"]
         response = client.get("/api/expert/sso", params={"ticket": token}, follow_redirects=False)
         assert response.status_code == 302
-        assert "Auth=verified-auth;" in response.headers["set-cookie"]
+        assert "Auth=" + VALID_AUTH + ";" in response.headers["set-cookie"]
         assert "late-source-mutation" not in response.headers["set-cookie"]
         assert "Kodeks=verified-session;" in response.headers["set-cookie"]
         assert "KodeksData=verified-data;" in response.headers["set-cookie"]
@@ -268,6 +271,55 @@ def test_empty_verified_result_does_not_fall_back_to_login(setup_sso):
     assert not store._tickets
     login.assert_not_awaited()
     old_login.assert_not_awaited()
+
+
+@pytest.mark.parametrize("http_only", [True, False])
+def test_padded_base64_auth_is_emitted_exactly_without_quotes(setup_sso, http_only):
+    app, config, _, _, login, _ = setup_sso
+    config.SSO_COOKIE_HTTPONLY = http_only
+    login.return_value = {"Auth": PADDED_AUTH_WITH_SYMBOLS, "Kodeks": "native-session"}
+    assert all(char in PADDED_AUTH_WITH_SYMBOLS for char in ("+", "/", "="))
+    with TestClient(app, base_url="https://cabinet-05.kodeks.expert") as client:
+        token = issue(client).json()["ticket"]
+        response = client.get("/api/expert/sso", params={"ticket": token}, follow_redirects=False)
+        assert response.status_code == 302
+        auth_headers = [h for h in response.headers.get_list("set-cookie") if h.startswith("Auth=")]
+        assert len(auth_headers) == 1
+        raw_value, *attributes = auth_headers[0].removeprefix("Auth=").split("; ")
+        assert raw_value == PADDED_AUTH_WITH_SYMBOLS
+        assert '"' not in auth_headers[0]
+        assert "Path=/" in attributes and "Secure" in attributes and "SameSite=Lax" in attributes
+        assert ("HttpOnly" in attributes) is http_only
+        assert all(not item.startswith(("Domain=", "Max-Age=", "Expires=")) for item in attributes)
+        assert client.cookies.get("Auth") == PADDED_AUTH_WITH_SYMBOLS
+        profile_request = client.get("/user/profile")
+        assert "Auth=" + PADDED_AUTH_WITH_SYMBOLS in profile_request.request.headers["cookie"]
+        assert "Kodeks=native-session" in profile_request.request.headers["cookie"]
+
+
+@pytest.mark.parametrize("value", ["\"dGVzdDpwYXNz\"", "dGVzdDpwYXNz\r\nInjected: yes", "dGVzdDpwYXNz ", "not-base64", "кодекс", "", "===="])
+def test_invalid_catalog_auth_fails_without_cookie_or_echo(value, setup_sso):
+    app, _, _, _, login, _ = setup_sso
+    login.return_value = {"Kodeks": "native-session", "Auth": value}
+    with TestClient(app, base_url="https://cabinet-05.kodeks.expert") as client:
+        token = issue(client).json()["ticket"]
+        response = client.get("/api/expert/sso", params={"ticket": token}, follow_redirects=False)
+        assert response.status_code in {401, 503}
+        assert not response.headers.get_list("set-cookie")
+        assert "Injected" not in response.text
+        assert "dGVzdDpwYXNz" not in response.text
+        assert client.get("/api/expert/sso", params={"ticket": token}).status_code == 401
+
+
+def test_invalid_verified_auth_is_not_stored_or_returned(setup_sso):
+    app, _, store, _, login, _ = setup_sso
+    AuthService.verify_sso_session.return_value = {"Auth": '\"dGVzdDpwYXNz\"'}
+    with TestClient(app) as client:
+        response = issue(client, cookies={"Auth": VALID_AUTH})
+    assert response.status_code in {401, 503}
+    assert "dGVzdDpwYXNz" not in response.text
+    assert not store._tickets
+    login.assert_not_awaited()
 
 
 def test_disabled_endpoints_return_404(setup_sso):
