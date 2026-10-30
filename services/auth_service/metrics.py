@@ -19,4 +19,7 @@ catalog_latency_ms = Histogram(
     buckets=(20, 50, 100, 200, 400, 800, 1200, 2000, 5000),
 )
 active_requests = Gauge("active_requests", "Active requests")
+sso_tickets_issued_total = Counter("sso_tickets_issued_total", "SSO tickets issued")
+sso_requests_total = Counter("sso_requests_total", "SSO browser requests", ["result"])
+sso_latency_ms = Histogram("sso_latency_ms", "SSO login latency (ms)", buckets=(100, 500, 1000, 3000, 10000, 30000))
 

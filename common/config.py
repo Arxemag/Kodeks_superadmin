@@ -60,6 +60,14 @@ class Settings(BaseSettings):
     PORT: int = Field(8000, description="HTTP server port (Auth API), env: PORT")
     AUTH_SERVICE_URL: str = Field("http://127.0.0.1:8000", description="Auth service base URL (для воркеров), env: AUTH_SERVICE_URL")
 
+    # --- SSO: nginx /sso на домене каталога, один процесс Auth API ---
+    SSO_ENABLED: bool = False
+    SSO_API_TOKEN: str = ""
+    SSO_TICKET_TTL: int = Field(60, gt=0, le=600)
+    SSO_TICKET_CAPACITY: int = Field(10000, gt=0)
+    SSO_LOGIN_TIMEOUT: float = Field(30.0, gt=0)
+    SSO_COOKIE_HTTPONLY: bool = True
+
     # --- Kafka (единый consumer в unified_worker или отдельные воркеры) ---
     KAFKA_BROKER: str = Field("", description="Kafka broker address")
     KAFKA_BOOTSTRAP_SERVERS: str = Field("", description="Kafka bootstrap servers")
@@ -180,6 +188,8 @@ class Settings(BaseSettings):
         Совместимость форматов: подставляем KAFKA_BOOTSTRAP_SERVERS из KAFKA_BROKER,
         собираем DB_URL из PG_* при отсутствии DB_URL. Проверка непустого DB_URL — fail-fast при старте.
         """
+        if self.SSO_ENABLED and not self.SSO_API_TOKEN.strip():
+            raise ValueError("SSO_API_TOKEN is required when SSO_ENABLED=true")
         if not self.KAFKA_BOOTSTRAP_SERVERS:
             self.KAFKA_BOOTSTRAP_SERVERS = self.KAFKA_BROKER or "127.0.0.1:9092"
 

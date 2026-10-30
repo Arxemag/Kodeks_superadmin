@@ -24,6 +24,8 @@ from common.exceptions import ServiceError
 from common.http import shutdown_http
 from common.logger import get_logger, get_trace_id, set_trace_id
 from services.auth_service import reg_admin
+from services.auth_service.sso import router as sso_router
+from services.auth_service.sso_store import MemoryTicketStore
 from services.auth_service.metrics import active_requests, auth_errors_total
 from services.auth_service.schemas import ErrorResponse, LoginRequest, OkResponse
 from services.auth_service.service import AuthService
@@ -44,7 +46,8 @@ async def lifespan(app: FastAPI):
     Жизненный цикл приложения: при старте проверяем конфиг (get_settings) и пишем лог,
     при завершении — закрываем HTTP-транспорт и пул БД.
     """
-    _ = get_settings()
+    settings = get_settings()
+    app.state.sso_store = MemoryTicketStore(ttl=settings.SSO_TICKET_TTL, capacity=settings.SSO_TICKET_CAPACITY)
     logger.info(f"service started (common={COMMON_VERSION})")
     yield
     await shutdown_http()
@@ -54,6 +57,8 @@ async def lifespan(app: FastAPI):
 def create_app() -> FastAPI:
     """Создаёт и возвращает экземпляр FastAPI с маршрутами и обработчиками ошибок."""
     app = FastAPI(title="Auth Service", lifespan=lifespan)
+    app.state.sso_store = MemoryTicketStore()
+    app.include_router(sso_router)
 
     @app.middleware("http")
     async def trace_and_metrics_mw(request: Request, call_next):
@@ -64,6 +69,9 @@ def create_app() -> FastAPI:
             set_trace_id(incoming or str(uuid.uuid4()))
             start = time.perf_counter()
             resp = await call_next(request)
+            if request.url.path in {"/api/expert/sso", "/api/expert/sso-ticket"}:
+                resp.headers["Cache-Control"] = "no-store"
+                resp.headers["Referrer-Policy"] = "no-referrer"
             resp.headers["X-Trace-Id"] = get_trace_id()
             resp.headers["X-Elapsed-Ms"] = f"{(time.perf_counter() - start) * 1000.0:.2f}"
             return resp
@@ -80,11 +88,13 @@ def create_app() -> FastAPI:
         )
 
     @app.exception_handler(RequestValidationError)
-    async def validation_error_handler(_: Request, exc: RequestValidationError):
+    async def validation_error_handler(request: Request, exc: RequestValidationError):
         """Ошибки валидации FastAPI (path/query/body) — ответ 422 и VALIDATION_ERROR."""
         return JSONResponse(
             status_code=422,
-            content=ErrorResponse(code="VALIDATION_ERROR", message=str(exc)).model_dump(),
+            content=ErrorResponse(code="VALIDATION_ERROR", message=(
+                "Invalid SSO request" if request.url.path == "/api/expert/sso-ticket" else str(exc)
+            )).model_dump(),
         )
 
     @app.exception_handler(Exception)
