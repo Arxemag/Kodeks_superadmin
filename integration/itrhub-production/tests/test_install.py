@@ -93,8 +93,20 @@ def test_handler_opens_popup_before_await_and_does_not_change_tree_urls():
     assert 'createCabinetSsoLink({ link }).unwrap()' in patched
     assert 'if (href && !isCatalogLink(href)) return;' in patched
     assert 'href={href || undefined}' in patched
-    assert 'getCabinetLink({ structId: structureId, cabinetName: module.name })' in patched
+    assert 'getCabinetLink({ structId, cabinetName })' in patched
+    assert patched.index('const cabinetName = module.name;') < patched.index('if (!structId || !cabinetName)') < patched.index('await getCabinetLink')
+    assert 'const link = resolvedLink;' in patched
     assert installer.patch_module_item(patched) == patched
+
+
+def test_previous_reviewed_sso_handler_can_be_upgraded_without_duplicating_imports():
+    current = installer.patch_module_item(ITEM)
+    begin, end = installer.handler_span(current)
+    previous = current[:begin] + '\n' + installer.PREVIOUS_SSO_HANDLER + current[end:]
+    upgraded = installer.patch_module_item(previous)
+    assert upgraded == current
+    assert upgraded.count('const [createCabinetSsoLink]') == 1
+    assert 'cabinetName: module.name' not in upgraded
 
 
 def test_unknown_handler_refuses_instead_of_overwriting_new_logic():

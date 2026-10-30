@@ -37,7 +37,14 @@ NEW_HANDLER = '''
     popup.opener = null;
     setIsResolvingLink(true);
     try {
-      const link = href || (await getCabinetLink({ structId: structureId, cabinetName: module.name }).unwrap())?.trim();
+      let resolvedLink = href;
+      if (!resolvedLink) {
+        const structId = structureId;
+        const cabinetName = module.name;
+        if (!structId || !cabinetName) throw new Error('Cabinet link is missing');
+        resolvedLink = (await getCabinetLink({ structId, cabinetName }).unwrap())?.trim() ?? '';
+      }
+      const link = resolvedLink;
       if (!link) throw new Error('Cabinet link is missing');
       if (!isCatalogLink(link)) { popup.location.replace(link); return; }
       const { url } = await createCabinetSsoLink({ link }).unwrap();
@@ -50,6 +57,14 @@ NEW_HANDLER = '''
       setIsResolvingLink(false);
     }
   '''
+PREVIOUS_SSO_HANDLER = NEW_HANDLER.replace('''      let resolvedLink = href;
+      if (!resolvedLink) {
+        const structId = structureId;
+        const cabinetName = module.name;
+        if (!structId || !cabinetName) throw new Error('Cabinet link is missing');
+        resolvedLink = (await getCabinetLink({ structId, cabinetName }).unwrap())?.trim() ?? '';
+      }
+      const link = resolvedLink;''', '''      const link = href || (await getCabinetLink({ structId: structureId, cabinetName: module.name }).unwrap())?.trim();''')
 INDEX_EXPORT = "export { useCreateCabinetSsoLinkMutation } from './api/ssoApi';"
 SIDEBAR_LINK = '''<Link key={`view-link-${idx}`} href={link.link} target='_blank' rel='noopener' underline='hover' variant='body2'>{link.name || link.link}</Link>'''
 SIDEBAR_LINK_SSO = '''<Link key={`view-link-${idx}`} href={link.link} target='_blank' rel='noopener' underline='hover' variant='body2' onClick={(event) => handleCatalogSsoOpen(event, link.link)}>{link.name || link.link}</Link>'''
@@ -122,11 +137,12 @@ def handler_span(source):
 
 def patch_module_item(source):
     begin, end = handler_span(source)
-    if compact(source[begin:end]) == compact(NEW_HANDLER):
+    current = compact(source[begin:end])
+    if current in (compact(NEW_HANDLER), compact(PREVIOUS_SSO_HANDLER)):
         required = ['useCreateCabinetSsoLinkMutation', 'isCatalogLink', 'enqueueSnackbar']
         if not all(name in source[:begin] for name in required):
             raise ValueError('Incomplete existing SSO handler integration')
-        return source
+        return source if current == compact(NEW_HANDLER) else source[:begin] + '\n' + NEW_HANDLER + source[end:]
     if compact(source[begin:end]) != compact(OLD_HANDLER):
         raise ValueError('ModuleItem handleOpen differs from the reviewed source; no changes written')
     source = source[:begin] + '\n' + NEW_HANDLER + source[end:]
