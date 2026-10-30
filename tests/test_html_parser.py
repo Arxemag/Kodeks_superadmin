@@ -11,7 +11,41 @@ from services.users_service.html_parser import (
     parse_group_creation_form,
     parse_groups_catalog,
     parse_user_state,
+    user_search_confirms_absence,
 )
+
+
+SEARCH_ABSENT = '''<form action="../users/users" method="POST">
+<input name="usr" value=""><input name="add" value=""><input name="tmpl" value="alice">
+</form><p>Пользователь &quot;alice&quot; не найден</p>'''
+
+
+def test_search_result_confirms_exact_requested_user_absence():
+    assert user_search_confirms_absence(SEARCH_ABSENT, "alice", page_url="https://catalog.test/users/users")
+
+
+@pytest.mark.parametrize("page", [
+    SEARCH_ABSENT.replace('value="alice"', 'value="other"'),
+    SEARCH_ABSENT.replace('&quot;alice&quot;', '&quot;other&quot;'),
+    SEARCH_ABSENT.replace('name="usr"', 'name="unknown"'),
+    SEARCH_ABSENT.replace('name="add"', 'name="unknown"'),
+    SEARCH_ABSENT.replace('name="tmpl"', 'name="unknown"'),
+    SEARCH_ABSENT.replace('name="usr" value=""', 'name="usr" value="alice"'),
+    SEARCH_ABSENT.replace('name="add" value=""', 'name="add" value="1"'),
+    SEARCH_ABSENT.replace('method="POST"', 'method="GET"'),
+    SEARCH_ABSENT.replace('action="../users/users"', 'action="https://other.test/users/users"'),
+    SEARCH_ABSENT.replace('action="../users/users"', 'action="/login"'),
+    SEARCH_ABSENT.replace('action="../users/users"', 'action="/users/users?tmpl=other"'),
+    SEARCH_ABSENT.replace('</form>', '<input name="tmpl" value="alice"></form>'),
+    SEARCH_ABSENT + '<a href="../users/usr?id=alice">alice</a>',
+    SEARCH_ABSENT + '<a href="usr?id=another">another</a>',
+    SEARCH_ABSENT + '<form action="/login"></form>',
+    SEARCH_ABSENT.replace('<p>', '<script>').replace('</p>', '</script>'),
+    SEARCH_ABSENT.replace('<p>', '<p hidden>'),
+    SEARCH_ABSENT.replace('Пользователь &quot;alice&quot; не найден', ''),
+])
+def test_uncertain_or_contradictory_user_search_never_confirms_absence(page):
+    assert not user_search_confirms_absence(page, "alice", page_url="https://catalog.test/users/users")
 
 
 def test_user_form_reads_spaced_and_unquoted_attributes_and_entities():

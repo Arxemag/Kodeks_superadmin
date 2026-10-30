@@ -52,12 +52,13 @@ def parse_form_pairs(html: str, *, required_names: set[str] | None = None, acl: 
     if include_save:
         # Submit only a real, identifiable Save control. Do not invent cmd=save.
         submitters = []
-        for node in form.walk():
+        for node in controls:
             kind = (node.attrs.get("type") or ("submit" if node.tag == "button" else "text")).lower()
             if node.tag not in {"input", "button"} or kind != "submit" or _disabled(node):
                 continue
             label = node.attrs.get("value") or node.text()
-            if "сохранить" in label.casefold() or "save" in label.casefold():
+            normalized_label = " ".join(label.casefold().split())
+            if "сохранить" in normalized_label or "save" in normalized_label or normalized_label == "установить":
                 submitters.append(node)
         if len(submitters) != 1:
             raise ParseError(code="ACL_SAVE_CONTROL_UNKNOWN", message="A unique actual Save submitter was not found in the ACL form")

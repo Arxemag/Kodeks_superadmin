@@ -338,7 +338,7 @@ async def apply_acl_via_browser(
             form = page.locator('form').filter(has=page.locator('input[name^="acl_infoboard_"]'))
             if await form.count() != 1:
                 raise ParseError(code="ACL_FORM_INVALID", message="A unique native ACL form was not found")
-            save = form.locator('input[type="submit"][value*="Сохранить"], input[type="submit"][value*="Save"], input[type="submit"][value="save"], button[type="submit"]')
+            save = form.locator('input[type="submit"][value*="Сохранить"], input[type="submit"][value*="Save"], input[type="submit"][value="save"], input[type="submit"][value="Установить"], button[type="submit"]')
             if await save.count() != 1:
                 raise ParseError(code="ACL_SAVE_CONTROL_UNKNOWN", message="A unique actual Save button was not found")
             try:

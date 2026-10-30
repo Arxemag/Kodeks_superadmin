@@ -8,21 +8,26 @@ from scripts.catalog_preflight import check_catalog, docs_directory_number, form
 from common.exceptions import ParseError
 
 
-GROUPS = '''<a href="grp?grp=7">Ecology</a><form action="groups">
-<input name="name"><input name="gn"><input name="private" value="DO_NOT_PRINT">
-</form>'''
+GROUPS = '''<a href="grp?grp=7">Ecology</a><form action="../users/grp " method="POST">
+<input type="SUBMIT" value="Create group"></form>'''
+GROUP_CREATE = '''<form action="../users/groups" method="POST">
+<input name="name"><input name="gn"><input name="cmd"><input name="private" value="DO_NOT_PRINT">
+<input type="SUBMIT" value="Save"></form>'''
 USER = '''<form action="users"><input name="uid" value=""><input name="psw" value="SECRET">
 <input name="token" value="DO_NOT_PRINT"><input name="repeat" value="a"><input name="repeat" value="b"></form>'''
 ACL = '''<form action="dirs"><input name="acl_infoboard_p1" value='{&quot;kw&quot;:[&quot;7&quot;]}'>
 <input name="acl_infoboard_p1_view" value='{&quot;kw&quot;:[&quot;7&quot;]}'></form>'''
 
 
-def transport_handler(requests, *, groups=GROUPS, user=USER, acl=ACL, boards=None):
+def transport_handler(requests, *, groups=GROUPS, group_create=GROUP_CREATE, user=USER, acl=ACL, boards=None):
     def handler(request):
         requests.append(request)
         path = request.url.path
         if path == "/users/groups":
             return httpx.Response(200, text=groups)
+        if path == "/users/grp":
+            assert request.method == "GET" and not request.url.query
+            return httpx.Response(200, text=group_create)
         if path == "/users/usr":
             text = user
             if request.url.params.get("id") == "alice":
@@ -55,6 +60,23 @@ async def test_preflight_reads_complete_forms_and_never_saves():
         assert private not in serialized
     user_check = next(c for c in checks if c["name"] == "user_creation_form")
     assert "repeat" in user_check["repeated_controls"]
+    assert [r.url.path for r in requests[:2]] == ["/users/groups", "/users/grp"]
+    group_check = next(c for c in checks if c["name"] == "group_creation_form")
+    assert group_check["control_names"] == ["cmd", "gn", "name", "private"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("creation_page", [
+    GROUPS, GROUP_CREATE.replace('name="gn"', 'name="gn" value="7"'),
+    GROUP_CREATE.replace('name="name"', 'name="name" value="Existing"'),
+])
+async def test_nonblank_or_unknown_creation_form_is_unverified_without_save(creation_page):
+    requests = []
+    handler = transport_handler(requests, group_create=creation_page)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        checks = await check_catalog("https://catalog.local", client, {})
+    assert {c["name"] for c in checks if c["status"] != "PASS"} == {"group_creation_form"}
+    assert not any(r.method == "POST" and r.url.path.startswith("/users") for r in requests)
 
 
 @pytest.mark.asyncio
@@ -93,6 +115,8 @@ async def test_graphql_business_errors_and_collisions_are_unverified(boards):
 
 def test_docs_directory_never_falls_back_to_arbitrary_number():
     assert docs_directory_number('<a href="/admin/dir?n=8">/docs/</a>') == "8"
+    assert docs_directory_number('<a href="/admin/dir?n=2"><b> /DOCS/ </b></a>'
+                                 '<a href="/admin/dir?n=12">/docs2/</a>') == "2"
     with pytest.raises(ParseError):
         docs_directory_number('<a href="/admin/dir?n=2">/users/</a>')
     with pytest.raises(ParseError):

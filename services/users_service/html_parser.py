@@ -8,7 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 import unicodedata
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urljoin, urlsplit
 
 from common.exceptions import ParseError
 
@@ -227,6 +227,43 @@ def parse_user_state(page_html: str) -> UserState:
         raise ParseError(code="HTML_PARSE_ERROR", message="Successful uid and psw controls were not found")
     return UserState(fields, sorted(set(groups)), pairs, not fields["uid"].strip(),
                      form.attrs.get("action") or "", (form.attrs.get("method") or "post").lower())
+
+
+def user_search_confirms_absence(page_html: str, uid: str, *, page_url: str) -> bool:
+    """Recognise the observed search result; a blank edit form alone is insufficient."""
+    root = _Document(page_html).root
+    forms = [node for node in root.walk() if node.tag == "form"]
+    if len(forms) != 1:
+        return False
+    form = forms[0]
+    if (form.attrs.get("method") or "").lower() != "post":
+        return False
+    action = form.attrs.get("action")
+    if not action:
+        return False
+    source = urlsplit(page_url)
+    target = urlsplit(urljoin(page_url, action))
+    if ((target.scheme, target.netloc, target.path) != (source.scheme, source.netloc, source.path)
+            or target.query or target.fragment):
+        return False
+    pairs = _successful(_form_controls(root, form))
+    for key, expected in (("usr", ""), ("add", ""), ("tmpl", uid)):
+        if [value for name, value in pairs if name == key] != [expected]:
+            return False
+    for node in root.walk():
+        if node.tag == "a":
+            link = urlsplit(node.attrs.get("href") or "")
+            # A filtered result containing any user entry contradicts absence.
+            if link.path.rstrip("/").endswith("/users/usr") or link.path.rstrip("/") == "usr":
+                return False
+
+    def visible_text(node):
+        if node.tag in {"script", "style", "head"} or "hidden" in node.attrs:
+            return ""
+        return "".join(child if isinstance(child, str) else visible_text(child) for child in node.children)
+
+    message = f'Пользователь "{uid}" не найден'
+    return message in " ".join(visible_text(root).split())
 
 
 def parse_groups_catalog(page_html: str) -> dict[str, int]:

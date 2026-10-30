@@ -3,7 +3,8 @@
 
 Инициализация: CatalogClient создаётся в worker с общим httpx.AsyncClient.
 Обработка: get_user_page — GET /users/usr?id=; post_user — POST /users/users; get_groups_page — GET /users/groups;
-create_group — POST /users/groups (при 404/405 — fallback на /users/grp). Ответы 401/403 -> AuthError, 5xx -> NetworkError.
+create_group — чтение /users/groups, GET шаблона /users/grp и POST полной формы на её action.
+Ответы 401/403 -> AuthError, 5xx -> NetworkError.
 """
 from __future__ import annotations
 
@@ -19,7 +20,7 @@ from common.catalog_lock import catalog_operation
 from common.logger import get_logger
 from services.users_service.html_parser import (
     parse_user_state, parse_groups_catalog, parse_group_creation_details,
-    group_index, normalize_title,
+    group_index, normalize_title, user_search_confirms_absence,
 )
 
 
@@ -99,7 +100,7 @@ class CatalogClient:
         return response
 
     async def get_user_page(self, base_url: str, uid: str, cookies: dict[str, str]) -> str | None:
-        """GET страницы пользователя по uid; при 4xx (кроме 401/403) возвращает None (пользователь не найден)."""
+        """Read a user; absence requires 404 or a verified filtered search result."""
         url = f"{base_url.rstrip('/')}/users/usr"
         logger.debug(f"catalog GET user page uid={uid!r} url={url!r} cookie_keys={sorted(cookies.keys())}")
         try:
@@ -120,6 +121,14 @@ class CatalogClient:
         _check_response(response)
         state = parse_user_state(response.text)
         if state.is_empty_form:
+            search_url = f"{base_url.rstrip('/')}/users/users"
+            try:
+                search = await self.http_client.get(search_url, params={"tmpl": uid}, cookies=cookies)
+            except (httpx.TimeoutException, httpx.NetworkError) as error:
+                raise NetworkError(code="CATALOG_READ_FAILED", message="Cannot verify user absence") from error
+            _check_response(search)
+            if user_search_confirms_absence(search.text, uid, page_url=search_url):
+                return None
             raise ParseError(code="USER_PRESENCE_UNCERTAIN", message="Blank user form does not confirm absence")
         if state.fields.get("uid") != uid and state.fields.get("id") != uid:
             raise ParseError(code="USER_IDENTITY_MISMATCH", message="Catalog returned another user")
@@ -183,6 +192,23 @@ class CatalogClient:
         parse_groups_catalog(response.text)
         return response.text
 
+    async def get_group_create_page(self, base_url: str, cookies: dict[str, str]) -> str:
+        """Read and validate the blank group template, separate from the groups index."""
+        page_url = f"{base_url.rstrip('/')}/users/grp"
+        try:
+            response = await self.http_client.get(page_url, cookies=cookies)
+        except (httpx.TimeoutException, httpx.NetworkError) as error:
+            raise NetworkError(code="CATALOG_READ_FAILED", message="Cannot read group creation form") from error
+        _check_response(response)
+        pairs, action, method = parse_group_creation_details(response.text)
+        if any(key in {"gn", "name"} and value.strip() for key, value in pairs):
+            raise ParseError(code="GROUP_CREATE_FORM_INVALID", message="Expected a blank group creation form")
+        if method != "post":
+            raise ParseError(code="CATALOG_FORM_METHOD", message="Group save form must use POST")
+        if action:
+            _form_target(page_url, action)
+        return response.text
+
     async def create_group(self, base_url: str, title: str, cookies: dict[str, str]) -> bool:
         async with self.operation(base_url):
             return await self._create_group(base_url, title, cookies)
@@ -196,12 +222,9 @@ class CatalogClient:
             raise ParseError(code="INVALID_GROUP_TITLE", message="Group title is empty")
         if normalized in groups:
             return False
-        url = f"{base_url.rstrip('/')}/users/groups"
-        current_form, form_action, form_method = parse_group_creation_details(page)
-        if any(key == "gn" and value.strip() for key, value in current_form):
-            raise ParseError(code="GROUP_CREATE_FORM_INVALID", message="Group creation form contains an existing group ID")
-        if form_method != "post":
-            raise ParseError(code="CATALOG_FORM_METHOD", message="Group save form must use POST")
+        url = f"{base_url.rstrip('/')}/users/grp"
+        creation_page = await self.get_group_create_page(base_url, cookies)
+        current_form, form_action, _ = parse_group_creation_details(creation_page)
         if form_action:
             url = _form_target(url, form_action)
         form_data = [(key, value) for key, value in current_form if key != "name"]

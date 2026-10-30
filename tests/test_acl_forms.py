@@ -103,6 +103,31 @@ def test_save_command_comes_from_actual_submitter():
     assert not any(key == "cmd" for key, _ in pairs)
 
 
+def test_live_acl_install_submitter_preserves_full_form_without_invented_command():
+    html = acl_page(extra='<input type=button value="Установить группы" onclick="setGroups()">').replace(
+        'name=cmd value=save', 'value="Установить"')
+    pairs = planned(html, [3])
+    assert not any(key == "cmd" for key, _ in pairs)
+    assert [(key, value) for key, value in pairs if key == "repeat"] == [("repeat", "A"), ("repeat", "B")]
+    assert dict(pairs)["unknown"] == ""
+
+
+def test_multiple_live_install_submitters_are_rejected():
+    html = acl_page(extra='<input type=submit value="Установить">').replace(
+        'name=cmd value=save', 'value="Установить"')
+    with pytest.raises(ParseError) as caught:
+        parse_form_pairs(html, acl=True, include_save=True)
+    assert caught.value.code == "ACL_SAVE_CONTROL_UNKNOWN"
+
+
+def test_save_submitter_associated_by_form_id_is_included():
+    html = acl_page().replace('<form', '<form id="settings"', 1).replace(
+        '<input type=submit name=cmd value=save>', '')
+    html += '<input type=submit form="settings" name=apply value="Установить">'
+    pairs = parse_form_pairs(html, acl=True, include_save=True)
+    assert ("apply", "Установить") in pairs
+
+
 @pytest.mark.parametrize("actual", [acl_page(), acl_page((3,), untouched=(9,)), acl_page((3,), active=False)])
 def test_verify_rejects_noop_unrelated_acl_change_or_missing_activation(actual):
     with pytest.raises(ParseError) as caught:

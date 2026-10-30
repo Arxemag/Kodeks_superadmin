@@ -61,7 +61,7 @@ class _DocsLinks(HTMLParser):
             target = urlsplit(self._target)
             query = parse_qs(target.query)
             if target.path.rstrip("/").endswith("admin/dir") and "n" in query:
-                if "/docs" in "".join(self._text).casefold():
+                if "".join(self._text).strip().casefold().rstrip("/") == "/docs":
                     self.links.extend(query["n"])
             self._target = None
 
@@ -97,7 +97,8 @@ async def check_catalog(base_url: str, http_client: httpx.AsyncClient,
     try:
         if groups_page is None:
             raise ParseError(code="GROUP_FORM_UNVERIFIED", message="Groups page was not read")
-        pairs = parse_group_creation_form(groups_page)
+        creation_page = await catalog.get_group_create_page(base_url, cookies)
+        pairs = parse_group_creation_form(creation_page)
         checks.append({"name": "group_creation_form", "status": "PASS", **form_schema(pairs)})
     except Exception as error:
         checks.append(_failure("group_creation_form", error))
