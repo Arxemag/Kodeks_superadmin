@@ -45,6 +45,21 @@ def _cookies_dict(cookies) -> Cookies:
     return {name: cookies.get(name) for name in cookies.keys()}
 
 
+def _check_catalog_maintenance(response) -> None:
+    """Recognise the native maintenance page, never a generic gateway failure."""
+    if response.status_code != 503:
+        return
+    from services.users_service.html_parser import _Document, normalize_title
+
+    root = _Document(response.text).root
+    titles = [normalize_title(node.text()) for node in root.walk() if node.tag == "title"]
+    body = normalize_title(root.text())
+    if (titles == ["регламентные работы"]
+            and "сервисному обслуживанию баз данных" in body):
+        raise NetworkError(code="CATALOG_MAINTENANCE", http_status=503,
+                           message="Catalog database maintenance is in progress")
+
+
 @dataclass(frozen=True)
 class AuthService:
     """Сервис логина в каталог: БД-сессия для reg_services и настройки (учётные данные, таймауты)."""
@@ -149,6 +164,7 @@ class AuthService:
                 for key, value in cookies.items():
                     client.cookies.set(key, value, domain=origin.hostname, path="/")
                 response = await client.get(f"{base_url}/docs/")
+                _check_catalog_maintenance(response)
                 _check_response(response)
                 if response.status_code != 200:
                     raise AuthError(code="SSO_USER_AUTH_FAILED", message="Catalog session was not accepted")

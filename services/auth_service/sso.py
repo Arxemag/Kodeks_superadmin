@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from common.config import Settings, get_settings
 from common.db import get_db
-from common.exceptions import ServiceError
+from common.exceptions import NetworkError, ServiceError
 from services.auth_service.metrics import sso_latency_ms, sso_requests_total, sso_tickets_issued_total
 from services.auth_service.service import AuthService
 from services.auth_service.sso_store import MemoryTicketStore, TicketStoreFull
@@ -104,6 +104,29 @@ def browser_error(code: str, status: int) -> HTMLResponse:
     )
 
 
+def maintenance_page() -> HTMLResponse:
+    """A static destination for a confirmed maintenance ticket, without login."""
+    return HTMLResponse(
+        '''<!doctype html><html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Регламентные работы</title>
+<style>
+*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;
+background:#f3f6fa;color:#213047;font-family:system-ui,-apple-system,"Segoe UI",sans-serif;padding:24px}
+main{width:min(100%,560px);background:#fff;padding:44px;border:1px solid #e0e7ef;
+border-radius:20px;box-shadow:0 12px 40px #23354d0a}
+.label{color:#4771a5;letter-spacing:.12em;font-size:12px;font-weight:700;text-transform:uppercase}
+h1{font-size:clamp(24px,5vw,32px);line-height:1.2;margin:20px 0 16px;letter-spacing:-.025em}
+p{font-size:17px;line-height:1.65;color:#526276;margin:0}.note{font-size:14px;margin-top:28px;color:#7b8796}
+</style></head><body><main><div class="label">Кодекс</div>
+<h1>Регламентные работы</h1>
+<p>В Кодексе выполняется сервисное обслуживание баз данных. Пожалуйста, попробуйте открыть кабинет позднее.</p>
+<p class="note">Можно закрыть эту вкладку и вернуться на портал.</p>
+</main></body></html>''',
+        status_code=503, headers={**_HEADERS, "X-SSO-Error": "CATALOG_MAINTENANCE"},
+    )
+
+
 @router.post("/sso-ticket")
 async def issue_ticket(payload: TicketRequest, request: Request,
                        api_token: str | None = Header(None, alias="X-Api-Token"),
@@ -124,11 +147,17 @@ async def issue_ticket(payload: TicketRequest, request: Request,
         auth = AuthService(db, settings.model_copy(update={"AUTH_HARD_TIMEOUT": settings.SSO_LOGIN_TIMEOUT}))
         base, _ = canonical_base(await auth._get_base_url(payload.reg))
         prepared = None
+        maintenance = False
         if payload.cookies is not None:
-            prepared = await auth.verify_sso_session(reg=payload.reg, name=payload.uid, cookies=payload.cookies)
-            if not prepared or not valid_auth_cookie(prepared.get("Auth")):
+            try:
+                prepared = await auth.verify_sso_session(reg=payload.reg, name=payload.uid, cookies=payload.cookies)
+            except NetworkError as error:
+                if error.code != "CATALOG_MAINTENANCE" or error.http_status != 503:
+                    raise
+                maintenance = True
+            if not maintenance and (not prepared or not valid_auth_cookie(prepared.get("Auth"))):
                 return JSONResponse({"code": "SSO_SESSION_INVALID", "message": "Prepared session is invalid"}, 401, headers=_HEADERS)
-        token = store.issue(reg=payload.reg, uid=payload.uid, path=path, base_url=base, cookies=prepared)
+        token = store.issue(reg=payload.reg, uid=payload.uid, path=path, base_url=base, cookies=prepared, maintenance=maintenance)
     except TicketStoreFull:
         return JSONResponse({"code": "SSO_CAPACITY", "message": "Try again later"}, 503, headers=_HEADERS)
     except ValueError:
@@ -161,6 +190,9 @@ async def consume_ticket(request: Request, settings: Settings = Depends(enabled_
         if request.url.hostname != host or fresh_host != host or fresh_base != base:
             result = "host_mismatch"
             return browser_error("SSO_HOST_MISMATCH", 400)
+        if ticket.maintenance:
+            result = "maintenance"
+            return maintenance_page()
         cookies = ticket.cookies
         if cookies is None:
             auth = AuthService(db, settings.model_copy(update={"AUTH_HARD_TIMEOUT": settings.SSO_LOGIN_TIMEOUT}))

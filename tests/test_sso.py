@@ -13,7 +13,7 @@ from pydantic import ValidationError
 
 from common.config import Settings, get_settings
 from common.db import get_db
-from common.exceptions import AuthError
+from common.exceptions import AuthError, NetworkError
 from services.auth_service.service import AuthService
 from services.auth_service.sso import router, get_ticket_store, validate_local_path
 from services.auth_service.sso_store import MemoryTicketStore, TicketStoreFull
@@ -222,6 +222,98 @@ def test_prepared_profile_mismatch_aborts_before_ticket_without_login(setup_sso)
     assert not store._tickets
     login.assert_not_awaited()
     old_login.assert_not_awaited()
+
+
+def test_confirmed_maintenance_issues_single_use_page_without_authentication(setup_sso):
+    app, _, store, _, login, old_login = setup_sso
+    verifier = AuthService.verify_sso_session
+    verifier.side_effect = NetworkError(code="CATALOG_MAINTENANCE", http_status=503, message="private-catalog-html")
+    with TestClient(app, base_url="https://cabinet-05.kodeks.expert") as client:
+        issued = issue(client, cookies={"Auth": VALID_AUTH})
+        assert issued.status_code == 200
+        assert set(issued.json()) == {"ticket", "url", "expires_in"}
+        ticket_data = next(iter(store._tickets.values()))
+        assert ticket_data.maintenance is True and ticket_data.cookies is None
+        token = issued.json()["ticket"]
+        response = client.get("/api/expert/sso", params={"ticket": token})
+        assert response.status_code == 503
+        assert "text/html" in response.headers["content-type"]
+        assert "<title>Регламентные работы</title>" in response.text
+        assert "В Кодексе выполняется сервисное обслуживание баз данных." in response.text
+        assert "Пожалуйста, попробуйте открыть кабинет позднее." in response.text
+        assert "private-catalog-html" not in response.text and VALID_AUTH not in response.text
+        assert not response.headers.get_list("set-cookie")
+        assert response.headers["cache-control"] == "no-store"
+        assert response.headers["referrer-policy"] == "no-referrer"
+        assert response.headers["x-sso-error"] == "CATALOG_MAINTENANCE"
+        assert client.get("/api/expert/sso", params={"ticket": token}).status_code == 401
+    assert verifier.await_count == 1
+    login.assert_not_awaited()
+    old_login.assert_not_awaited()
+
+
+@pytest.mark.parametrize("failure", [
+    NetworkError(code="CATALOG_5XX", http_status=503),
+    NetworkError(code="CATALOG_MAINTENANCE", http_status=502),
+    AuthError(code="CATALOG_MAINTENANCE", http_status=503),
+])
+def test_other_errors_do_not_issue_maintenance_tickets(failure, setup_sso):
+    app, _, store, _, login, old_login = setup_sso
+    AuthService.verify_sso_session.side_effect = failure
+    with TestClient(app) as client:
+        response = issue(client, cookies={"Auth": VALID_AUTH})
+    assert response.status_code == failure.http_status
+    assert "ticket" not in response.json()
+    assert not store._tickets
+    login.assert_not_awaited()
+    old_login.assert_not_awaited()
+
+
+@pytest.mark.parametrize("mismatch", ["request_host", "registry"])
+def test_maintenance_ticket_is_host_and_fresh_registration_bound(mismatch, setup_sso):
+    app, _, _, resolver, login, old_login = setup_sso
+    AuthService.verify_sso_session.side_effect = NetworkError(code="CATALOG_MAINTENANCE", http_status=503)
+    with TestClient(app, base_url="https://cabinet-05.kodeks.expert") as client:
+        token = issue(client, cookies={"Auth": VALID_AUTH}).json()["ticket"]
+        if mismatch == "registry":
+            resolver.return_value = "https://cabinet-06.kodeks.expert"
+        url = "/api/expert/sso" if mismatch == "registry" else "https://cabinet-06.kodeks.expert/api/expert/sso"
+        response = client.get(url, params={"ticket": token})
+        assert response.status_code == 400 and response.headers["x-sso-error"] == "SSO_HOST_MISMATCH"
+        assert "<title>Регламентные работы</title>" not in response.text
+        assert not response.headers.get_list("set-cookie")
+        assert client.get("/api/expert/sso", params={"ticket": token}).status_code == 401
+    login.assert_not_awaited()
+    old_login.assert_not_awaited()
+
+
+def test_maintenance_requires_verified_session_error_not_failed_registry_resolution(setup_sso):
+    app, _, store, resolver, login, _ = setup_sso
+    resolver.side_effect = NetworkError(code="CATALOG_MAINTENANCE", http_status=503)
+    with TestClient(app) as client:
+        assert issue(client, cookies={"Auth": VALID_AUTH}).status_code == 503
+    assert not store._tickets
+    AuthService.verify_sso_session.assert_not_awaited()
+    login.assert_not_awaited()
+
+
+def test_browser_cannot_request_maintenance_mode(setup_sso):
+    app, _, store, _, login, _ = setup_sso
+    with TestClient(app) as client:
+        assert issue(client, maintenance=True).status_code == 422
+    assert not store._tickets
+    AuthService.verify_sso_session.assert_not_awaited()
+    login.assert_not_awaited()
+
+
+def test_maintenance_store_expiry_and_default_mode():
+    now = [10.0]
+    store = MemoryTicketStore(ttl=5, clock=lambda: now[0])
+    ordinary = store.issue(reg="r", uid="u", path="/", base_url="https://catalog")
+    assert store.pop(ordinary).maintenance is False
+    expired = store.issue(reg="r", uid="u", path="/", base_url="https://catalog", maintenance=True)
+    now[0] = 15.0
+    assert store.pop(expired) is None
 
 
 @pytest.mark.parametrize("prepared", [{}, {"Auth": ""}, {"Auth": "  "}, {"Auth": "a", "Other": "private-other"}, {"Auth": "a" * 4097}, {"Auth": "a", "Kodeks": "x" * 4097}, {"Auth": "a", "KodeksData": "x\r\nheader"}])

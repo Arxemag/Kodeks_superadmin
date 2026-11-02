@@ -21,6 +21,7 @@ class TicketData:
     base_url: str
     expires_at: float
     _cookies: Mapping[str, str] | None = field(default=None, repr=False)
+    maintenance: bool = False
 
     @property
     def cookies(self) -> dict[str, str] | None:
@@ -51,7 +52,7 @@ class MemoryTicketStore:
             self._tickets.pop(first)
 
     def issue(self, *, reg: str, uid: str, path: str, base_url: str,
-              cookies: dict[str, str] | None = None) -> str:
+              cookies: dict[str, str] | None = None, maintenance: bool = False) -> str:
         with self._lock:
             now = self.clock()
             self._expire(now)
@@ -62,8 +63,8 @@ class MemoryTicketStore:
                 key = hashlib.sha256(token.encode()).hexdigest()
                 if key not in self._tickets:
                     break
-            snapshot = MappingProxyType(deepcopy(cookies)) if cookies is not None else None
-            self._tickets[key] = TicketData(reg, uid, path, base_url, now + self.ttl, snapshot)
+            snapshot = MappingProxyType(deepcopy(cookies)) if cookies is not None and not maintenance else None
+            self._tickets[key] = TicketData(reg, uid, path, base_url, now + self.ttl, snapshot, maintenance)
             return token
 
     def pop(self, token: str) -> TicketData | None:

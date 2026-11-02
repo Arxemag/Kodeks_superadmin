@@ -201,7 +201,7 @@ def session_auth(value="employee:catalog-secret"):
 
 @pytest.fixture
 def setup_session(monkeypatch):
-    def create(*, status=200, login_form=False, slow=False, redirect=False, clear_auth=False):
+    def create(*, status=200, login_form=False, slow=False, redirect=False, clear_auth=False, page=None):
         settings = SimpleNamespace(AUTH_HARD_TIMEOUT=0.02 if slow else 5)
         service = AuthService(db=None, settings=settings)
         resolver = AsyncMock(return_value="https://tenant-465304.test")
@@ -222,7 +222,7 @@ def setup_session(monkeypatch):
                 headers.append(("Set-Cookie", "Auth=; Path=/"))
             body = ('<form id="authForm" method="post"><input name="login">'
                     '<input name="password" type="password"></form>') if login_form else '<title>Главная страница</title>'
-            return httpx.Response(status, headers=headers, text=body)
+            return httpx.Response(status, headers=headers, text=body if page is None else page)
 
         original = httpx.AsyncClient
         monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: original(
@@ -293,3 +293,19 @@ async def test_session_password_can_contain_a_colon(setup_session):
     service, _, _ = setup_session()
     cookie = session_auth("employee:secret:with:colon")
     assert (await service.verify_sso_session("465304", "employee", {"Auth": cookie}))["Auth"] == cookie
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("page,code", [
+    ('<title>Регламентные работы</title><p>В настоящее время ведутся технологические работы '
+     'по&nbsp;сервисному обслуживанию баз данных</p>', 'CATALOG_MAINTENANCE'),
+    ('<title>Service unavailable</title>', 'CATALOG_5XX'),
+    ('<title>Регламентные работы</title><p>Unknown failure</p>', 'CATALOG_5XX'),
+    ('<title>Unknown</title><p>сервисному обслуживанию баз данных</p>', 'CATALOG_5XX'),
+])
+async def test_prepared_session_distinguishes_verified_maintenance_from_other_503(setup_session, page, code):
+    service, requests, _ = setup_session(status=503, page=page)
+    with pytest.raises(NetworkError) as error:
+        await service.verify_sso_session('465304', 'employee', {'Auth': session_auth()})
+    assert error.value.code == code
+    assert len(requests) == 1
