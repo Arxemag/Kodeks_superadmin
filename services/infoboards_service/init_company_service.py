@@ -510,6 +510,7 @@ class InitCompanyService:
         if not acl_write_needed(form_data, setup_html):
             await self.acl_ownership.replace(base_url, reg, next_owned)
             return
+        uncertain_response: str | None = None
         try:
             response = await self.http_client.post(
                 post_url, content=urlencode(form_data), cookies=cookies,
@@ -517,21 +518,34 @@ class InitCompanyService:
                 timeout=getattr(self.settings, "ACL_WRITE_TIMEOUT", 60.0),
             )
         except httpx.RequestError as error:
-            raise ParseError(code="ACL_WRITE_UNCERTAIN", message=f"ACL POST outcome is unknown ({type(error).__name__}); inspect the catalog before retrying") from error
-        if response.status_code in (401, 403):
-            raise AuthError(code="CATALOG_AUTH_FAILED", message="Admin cookies rejected for ACL write", http_status=401)
-        if response.status_code >= 500:
-            raise ParseError(code="ACL_WRITE_UNCERTAIN", message=f"ACL POST returned HTTP {response.status_code}; inspect the catalog before retrying")
-        if response.status_code >= 400:
-            raise NetworkError(code="ADMIN_DIRS_FAILED", message=f"ACL POST status={response.status_code}")
+            uncertain_response = f"{type(error).__name__}"
+        if uncertain_response is None:
+            if response.status_code in (401, 403):
+                raise AuthError(code="CATALOG_AUTH_FAILED", message="Admin cookies rejected for ACL write", http_status=401)
+            if response.status_code >= 500:
+                uncertain_response = f"HTTP {response.status_code}"
+            elif response.status_code >= 400:
+                raise NetworkError(code="ADMIN_DIRS_FAILED", message=f"ACL POST status={response.status_code}")
         try:
             actual_html, _, _, _ = await fetch_acl_form_via_http(
                 base_url, self.http_client, cookies, docs_n=docs_n,
             )
         except Exception as error:
-            raise ParseError(code="ACL_WRITE_UNCERTAIN", message="ACL POST returned, but its result cannot be read; inspect the catalog before retrying") from error
-        verify_acl_form(form_data, actual_html)
+            detail = f" ({uncertain_response})" if uncertain_response else ""
+            raise ParseError(code="ACL_WRITE_UNCERTAIN", message=f"ACL POST outcome{detail} cannot be read; inspect the catalog before retrying") from error
+        if uncertain_response:
+            # A lost response is not permission to repeat a full-form POST.
+            # Confirm every submitted ACL and flag, including untouched boards,
+            # using one fresh read before recording successful ownership.
+            try:
+                verify_acl_form(form_data, actual_html)
+            except Exception as error:
+                raise ParseError(code="ACL_WRITE_UNCERTAIN", message=f"ACL POST outcome ({uncertain_response}) is not confirmed by a complete fresh read; inspect the catalog before retrying") from error
+        else:
+            verify_acl_form(form_data, actual_html)
         try:
             await self.acl_ownership.replace(base_url, reg, next_owned)
         except NetworkError as error:
             raise ParseError(code="ACL_OWNERSHIP_PERSIST_UNCERTAIN", message="ACL change was verified but ownership could not be recorded; reconcile before retrying") from error
+        if uncertain_response:
+            logger.warning("ACL_WRITE_CONFIRMED_AFTER_UNCERTAIN_RESPONSE reg=%r response=%s", reg, uncertain_response)

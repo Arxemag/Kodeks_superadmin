@@ -3,10 +3,11 @@ import json
 from contextlib import asynccontextmanager
 from html import escape
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 from urllib.parse import parse_qsl
 
 import pytest
+import httpx
 from sqlalchemy.exc import OperationalError
 
 from common import acl_ownership
@@ -41,6 +42,70 @@ def configure(monkeypatch):
         client = SimpleNamespace(post=AsyncMock(return_value=SimpleNamespace(status_code=200)))
         return company.InitCompanyService(None, None, client, None, repo), repo, client, fetch
     return setup
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('response', ['timeout', 'http_500'])
+async def test_uncertain_response_can_succeed_only_after_complete_fresh_proof(configure, monkeypatch, response):
+    service, repo, client, fetch = configure(
+        form((99,), (98,), second=(7,)),
+        form((3, 99), (3, 98), second=(7,)),
+    )
+    warning = Mock()
+    monkeypatch.setattr(company.logger, 'warning', warning)
+    if response == 'timeout':
+        client.post.side_effect = httpx.ReadTimeout('private-cookie-and-url')
+    else:
+        client.post.return_value.status_code = 500
+    await service._apply_acl('https://catalog', {}, {'P1': [3]}, {}, reg='reg-a')
+    client.post.assert_awaited_once()
+    assert fetch.await_count == 2
+    repo.replace.assert_awaited_once_with('https://catalog', 'reg-a', {A: {3}, V: {3}})
+    assert warning.call_args.args[0].startswith('ACL_WRITE_CONFIRMED_AFTER_UNCERTAIN_RESPONSE')
+
+
+@pytest.mark.asyncio
+async def test_timeout_with_unchanged_native_form_remains_uncertain(configure):
+    service, repo, client, fetch = configure(form((99,), (98,)), form((99,), (98,)))
+    client.post.side_effect = httpx.ReadTimeout('private-cookie-and-url')
+    with pytest.raises(ParseError) as caught:
+        await service._apply_acl('https://catalog', {}, {'P1': [3]}, {}, reg='reg-a')
+    assert caught.value.code == 'ACL_WRITE_UNCERTAIN'
+    assert 'private-cookie-and-url' not in caught.value.message
+    client.post.assert_awaited_once()
+    assert fetch.await_count == 2
+    repo.replace.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_timeout_with_failed_confirmation_read_does_not_record_ownership(configure):
+    service, repo, client, fetch = configure(form((99,), (98,)))
+    fetch.side_effect = [(form((99,), (98,)), 'https://catalog/admin/dirs', '', '2'),
+                         NetworkError(code='ADMIN_GET_FAILED', message='offline')]
+    client.post.side_effect = httpx.ReadTimeout('response lost')
+    with pytest.raises(ParseError) as caught:
+        await service._apply_acl('https://catalog', {}, {'P1': [3]}, {}, reg='reg-a')
+    assert caught.value.code == 'ACL_WRITE_UNCERTAIN'
+    client.post.assert_awaited_once()
+    repo.replace.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('changed', ['untouched_edit', 'untouched_view', 'untouched_flag', 'missing_board'])
+async def test_timeout_proof_checks_untouched_boards_and_activation_flags(configure, changed):
+    after = form((3, 99), (3, 98), second=(8 if changed == 'untouched_edit' else 7,),
+                 second_view=(8 if changed == 'untouched_view' else 7,))
+    if changed == 'untouched_flag':
+        after = after.replace('name="infoboard_p2_view" checked', 'name="infoboard_p2_view" ')
+    elif changed == 'missing_board':
+        after = form((3, 99), (3, 98))
+    service, repo, client, _ = configure(form((99,), (98,), second=(7,)), after)
+    client.post.side_effect = httpx.ReadTimeout('response lost')
+    with pytest.raises(ParseError) as caught:
+        await service._apply_acl('https://catalog', {}, {'P1': [3]}, {}, reg='reg-a')
+    assert caught.value.code == 'ACL_WRITE_UNCERTAIN'
+    client.post.assert_awaited_once()
+    repo.replace.assert_not_awaited()
 
 
 @pytest.mark.asyncio
