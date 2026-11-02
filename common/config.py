@@ -49,6 +49,7 @@ class Settings(BaseSettings):
     ADMIN_PASSWORD: str = Field(..., description="Catalog admin password")
 
     HTTP_TIMEOUT: float = Field(10.0, description="HTTP timeout seconds")
+    ACL_WRITE_TIMEOUT: float = Field(60.0, gt=0, allow_inf_nan=False, description="ACL save HTTP timeout seconds; uncertain writes require reconciliation")
     CATALOG_LOCK_TIMEOUT: float = Field(30.0, gt=0, description="Catalog database lock wait timeout seconds")
     USER_BASE_GROUP_TITLE: str = Field("", description="Opt-in native non-admin group for portal entry; resolved by unique title per catalog")
     LOG_LEVEL: str = Field("INFO", description="Log level")

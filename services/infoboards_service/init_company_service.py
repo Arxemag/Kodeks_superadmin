@@ -502,9 +502,10 @@ class InitCompanyService:
             response = await self.http_client.post(
                 post_url, content=urlencode(form_data), cookies=cookies,
                 headers={"Content-Type": "application/x-www-form-urlencoded", "Referer": f"{base_url}/admin/dir", "Origin": base_url.rstrip("/")},
+                timeout=getattr(self.settings, "ACL_WRITE_TIMEOUT", 60.0),
             )
         except httpx.RequestError as error:
-            raise ParseError(code="ACL_WRITE_UNCERTAIN", message="ACL POST outcome is unknown; inspect the catalog before retrying") from error
+            raise ParseError(code="ACL_WRITE_UNCERTAIN", message=f"ACL POST outcome is unknown ({type(error).__name__}); inspect the catalog before retrying") from error
         if response.status_code in (401, 403):
             raise AuthError(code="CATALOG_AUTH_FAILED", message="Admin cookies rejected for ACL write", http_status=401)
         if response.status_code >= 500:

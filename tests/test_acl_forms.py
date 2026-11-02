@@ -250,11 +250,13 @@ def test_verify_rejects_noop_unrelated_acl_change_or_missing_activation(actual):
 
 
 @pytest.mark.asyncio
-async def test_http_acl_requires_fresh_read_and_preserves_repeats(monkeypatch, ownership):
+@pytest.mark.parametrize("timeout", [None, 42.5])
+async def test_http_acl_requires_fresh_read_and_preserves_repeats(monkeypatch, ownership, timeout):
     fetch = AsyncMock(side_effect=[(acl_page(), "https://catalog/admin/dirs", "", "2"), (acl_page((1, 3)), "", "", "2")])
     monkeypatch.setattr(company, "fetch_acl_form_via_http", fetch)
     client = SimpleNamespace(post=AsyncMock(return_value=SimpleNamespace(status_code=200)))
-    service = company.InitCompanyService(None, None, client, None, ownership)
+    settings = None if timeout is None else SimpleNamespace(ACL_WRITE_TIMEOUT=timeout)
+    service = company.InitCompanyService(None, settings, client, None, ownership)
 
     await service._apply_acl("https://catalog", {}, {"P1": [3]}, {}, reg="reg-a")
 
@@ -262,6 +264,7 @@ async def test_http_acl_requires_fresh_read_and_preserves_repeats(monkeypatch, o
     assert [(key, value) for key, value in sent if key == "repeat"] == [("repeat", "A"), ("repeat", "B")]
     assert ("unknown", "") in sent
     assert fetch.await_count == 2
+    assert client.post.await_args.kwargs["timeout"] == (60.0 if timeout is None else timeout)
 
 
 @pytest.mark.asyncio
@@ -286,7 +289,7 @@ async def test_unknown_required_board_fails_before_http_write(monkeypatch, owner
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('failure', ['timeout', 'http_500', 'read_after_write'])
+@pytest.mark.parametrize('failure', ['timeout', 'connect_error', 'http_500', 'read_after_write'])
 async def test_acl_post_uncertain_outcome_never_becomes_retryable(monkeypatch, ownership, failure):
     before = (acl_page(), 'https://catalog/admin/dirs', '', '2')
     fetch = AsyncMock(return_value=before)
@@ -295,13 +298,27 @@ async def test_acl_post_uncertain_outcome_never_becomes_retryable(monkeypatch, o
     monkeypatch.setattr(company, 'fetch_acl_form_via_http', fetch)
     post = AsyncMock(return_value=SimpleNamespace(status_code=500 if failure == 'http_500' else 200))
     if failure == 'timeout':
-        post.side_effect = httpx.ReadTimeout('response not received')
+        post.side_effect = httpx.ReadTimeout('private-cookie-and-url')
+    if failure == 'connect_error':
+        post.side_effect = httpx.ConnectError('private-cookie-and-url')
     service = company.InitCompanyService(None, None, SimpleNamespace(post=post), None, ownership)
     with pytest.raises(ParseError) as caught:
         await service._apply_acl('https://catalog', {}, {'P1': [3]}, {}, reg='reg-a')
     assert caught.value.code == 'ACL_WRITE_UNCERTAIN'
     post.assert_awaited_once()
     ownership.replace.assert_not_awaited()
+    if failure in {'timeout', 'connect_error'}:
+        assert type(post.side_effect).__name__ in caught.value.message
+        assert 'private-cookie-and-url' not in caught.value.message
+
+
+@pytest.mark.parametrize('timeout', [0, -1, float('inf'), float('nan')])
+def test_acl_write_timeout_must_be_finite_and_positive(timeout):
+    from common.config import Settings
+    from pydantic import ValidationError
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, DB_URL='postgresql+asyncpg://stub/db', ADMIN_LOGIN='stub',
+                 ADMIN_PASSWORD='unused', ACL_WRITE_TIMEOUT=timeout)
 
 
 @pytest.mark.asyncio
