@@ -212,7 +212,7 @@ class InitCompanyService:
                     text(f"""
                         INSERT INTO {tbl}
                         (department_id, service_group_name, reg, client_id, client_name, mapping_status, catalog_group_name)
-                        VALUES (:dept_id, :title, :reg, :client_id, :company_name, 'active', :title)
+                        VALUES (:dept_id, CAST(:title AS TEXT), :reg, :client_id, :company_name, 'active', CAST(:title AS TEXT))
                     """),
                     {
                         "dept_id": dept_id,

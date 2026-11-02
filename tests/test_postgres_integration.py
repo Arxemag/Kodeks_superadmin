@@ -16,11 +16,13 @@ from pathlib import Path
 import pytest
 import pytest_asyncio
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
 from common import catalog_lock
 from common.event_store import EventStore, IncomingEvent
+from services.infoboards_service.dto import InitCompanyDTO
+from services.infoboards_service.init_company_service import InitCompanyService
 
 
 @pytest_asyncio.fixture
@@ -68,6 +70,32 @@ async def row(pg, statement, **params):
     async with pg.maker() as session:
         result = await session.execute(text(statement), params)
         return result.mappings().first()
+
+
+@pytest.mark.asyncio
+async def test_real_db_sync_mapping_with_varchar_and_text_titles(postgres):
+    # The live schema stores the two group names in different PostgreSQL types.
+    # Reusing one untyped parameter for both caused SQLSTATE 42P08 on INSERT.
+    async with postgres.engine.connect() as connection:
+        await connection.execute(text('''CREATE TEMP TABLE test_mapping (
+            id bigserial PRIMARY KEY, department_id uuid NOT NULL,
+            service_group_name varchar(255) NOT NULL, reg varchar(50) NOT NULL,
+            client_id varchar(100) NOT NULL, client_name varchar(255) NOT NULL,
+            mapping_status varchar(20) NOT NULL, catalog_group_id bigint,
+            catalog_group_name text
+        )'''))
+        await connection.commit()
+        async with AsyncSession(bind=connection, expire_on_commit=False) as session:
+            service = InitCompanyService(session, SimpleNamespace(DB_TABLE_DEPARTMENT_MAPPING='test_mapping'), None, None)
+            department_id = uuid4()
+            dto = InitCompanyDTO(id=31, reg='test-reg', departments=[
+                {'id': department_id, 'title': 'Контроль качества', 'modules': []},
+            ])
+            await service._sync_mapping_table(dto.reg, dto)
+            await service._sync_mapping_table(dto.reg, dto)
+            result = await session.execute(text('''SELECT department_id::text, service_group_name,
+                catalog_group_name, mapping_status FROM test_mapping'''))
+            assert result.all() == [(str(department_id), 'Контроль качества', 'Контроль качества', 'active')]
 
 
 @pytest.mark.asyncio
