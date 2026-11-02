@@ -50,6 +50,7 @@ class Settings(BaseSettings):
 
     HTTP_TIMEOUT: float = Field(10.0, description="HTTP timeout seconds")
     CATALOG_LOCK_TIMEOUT: float = Field(30.0, gt=0, description="Catalog database lock wait timeout seconds")
+    USER_BASE_GROUP_TITLE: str = Field("", description="Opt-in native non-admin group for portal entry; resolved by unique title per catalog")
     LOG_LEVEL: str = Field("INFO", description="Log level")
     CHROMIUM_WS_ENDPOINT: str = Field(
         "",

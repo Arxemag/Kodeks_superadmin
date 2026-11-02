@@ -12,6 +12,14 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
+class DepartmentDTO(BaseModel):
+    """Один отдел в списке departments: id и title."""
+    model_config = ConfigDict(extra="ignore")
+
+    id: str = Field(..., min_length=1)
+    title: str = Field(..., min_length=1)
+
+
 class CreateUserDTO(BaseModel):
     """Сообщение топика create-user: reg, uid, psw обязательны; остальные поля и grp опциональны. Лишние ключи игнорируются."""
     model_config = ConfigDict(extra="ignore")
@@ -27,6 +35,16 @@ class CreateUserDTO(BaseModel):
     telephon: str | None = None
     end: str | None = None
     grp: list[int] | None = None
+    # Omission preserves legacy group semantics; an explicit empty snapshot
+    # requests no department access. Explicit null is not a snapshot.
+    departments: list[DepartmentDTO] | None = None
+
+    @field_validator("departments")
+    @classmethod
+    def reject_null_departments(cls, value):
+        if value is None:
+            raise ValueError("Omit departments for legacy semantics; null is not a department snapshot")
+        return value
 
     @field_validator("grp")
     @classmethod
@@ -56,14 +74,6 @@ class UpdateUserDTO(CreateUserDTO):
         if value is None:
             raise ValueError("Omit psw to preserve the existing password; null is not a password")
         return value
-
-
-class DepartmentDTO(BaseModel):
-    """Один отдел в списке departments: id и title."""
-    model_config = ConfigDict(extra="ignore")
-
-    id: str = Field(..., min_length=1)
-    title: str = Field(..., min_length=1)
 
 
 class UpdateUserDepartmentsDTO(BaseModel):

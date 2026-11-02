@@ -42,6 +42,23 @@ def test_create_user_dto_extra_ignored() -> None:
     assert not hasattr(d, "unknown") or getattr(d, "unknown", None) != "x"
 
 
+def test_create_departments_distinguishes_omission_empty_and_snapshot():
+    legacy = CreateUserDTO(reg="1", uid="u", psw="p")
+    assert legacy.departments is None and "departments" not in legacy.model_fields_set
+    empty = CreateUserDTO(reg="1", uid="u", psw="p", departments=[])
+    assert empty.departments == [] and "departments" in empty.model_fields_set
+    snapshot = CreateUserDTO(reg="1", uid="u", psw="p", departments=[{"id": "legacy-dept-id", "title": "Ecology"}])
+    assert snapshot.departments[0].id == "legacy-dept-id"
+    with pytest.raises(ValidationError):
+        CreateUserDTO(reg="1", uid="u", psw="p", departments=None)
+
+
+@pytest.mark.parametrize("department", [{"id": "", "title": "Dept"}, {"id": "d", "title": ""}, {"title": "Dept"}])
+def test_create_department_snapshot_requires_department_identity_and_title(department):
+    with pytest.raises(ValidationError):
+        CreateUserDTO(reg="1", uid="u", psw="p", departments=[department])
+
+
 def test_update_user_dto_has_id() -> None:
     d = UpdateUserDTO.model_validate({"reg": "1", "uid": "u", "psw": "p"})
     assert d.id is None

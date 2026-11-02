@@ -74,6 +74,200 @@ async def test_create_reads_template_and_verifies_write():
 
 
 @pytest.mark.asyncio
+async def test_create_department_dependency_must_be_ready_before_catalog_write():
+    catalog = Catalog([])
+    instance = service(catalog)
+    with pytest.raises(NetworkError) as error:
+        await instance.handle_create(CreateUserDTO(reg="1", uid="alice", psw="password",
+            departments=[{"id": "not-ready", "title": "Ecology"}]))
+    assert error.value.code == "DEPARTMENT_GROUP_NOT_READY"
+    catalog.get_user_page.assert_not_awaited()
+    catalog.post_user.assert_not_awaited()
+    catalog.create_group.assert_not_awaited()
+    catalog.get_user_create_page.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_create_stale_department_binding_waits_before_user_is_created():
+    catalog = Catalog([])
+    catalog.get_groups_page.return_value = '<a href="grp?grp=8">Another department</a>'
+    instance = service(catalog)
+    instance.department_groups = StubDepartmentGroups({"stable-id": 7})
+    with pytest.raises(NetworkError) as error:
+        await instance.handle_create(CreateUserDTO(reg="1", uid="alice", psw="password",
+            departments=[{"id": "stable-id", "title": "Ecology"}]))
+    assert error.value.code == "DEPARTMENT_GROUP_NOT_READY"
+    catalog.get_user_page.assert_not_awaited()
+    catalog.post_user.assert_not_awaited()
+    catalog.create_group.assert_not_awaited()
+
+
+PORTAL_GROUPS = '<a href="grp?grp=7">Ecology</a><a href="grp?grp=83">Portal entry</a>'
+
+
+@pytest.mark.asyncio
+async def test_create_assigns_configured_native_portal_role_and_department_in_one_post():
+    catalog = Catalog([None, user_page(groups=(7, 83))])
+    catalog.get_groups_page.return_value = PORTAL_GROUPS
+    instance = service(catalog)
+    instance.base_group_title = "  PORTAL   ENTRY  "
+    instance.department_groups = StubDepartmentGroups({"department": 7})
+    await instance.handle_create(CreateUserDTO(reg="1", uid="alice", psw="password",
+        departments=[{"id": "department", "title": "Ecology"}]))
+    catalog.post_user.assert_awaited_once()
+    assert {int(v) for k, v in catalog.post_user.call_args.args[1] if k == "grp"} == {7, 83}
+    assert await instance.group_ownership.get("1", "alice") == {7}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("snapshot", [{}, {"departments": []}])
+async def test_configured_portal_only_create_never_inherits_default_admin_group(snapshot):
+    catalog = Catalog([None, user_page(groups=(83,))])
+    catalog.get_groups_page.return_value = PORTAL_GROUPS
+    catalog.get_user_create_page.return_value = USER_TEMPLATE.replace("</form>", '<input type="checkbox" name="grp" value="1" checked></form>')
+    instance = service(catalog)
+    instance.base_group_title = "Portal entry"
+    await instance.handle_create(CreateUserDTO(reg="1", uid="alice", psw="password", **snapshot))
+    assert [(k, v) for k, v in catalog.post_user.call_args.args[1] if k == "grp"] == [("grp", "83")]
+    assert await instance.group_ownership.get("1", "alice") == set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["departments", "explicit_grp"])
+async def test_clearing_departments_preserves_portal_and_manual_membership(operation):
+    catalog = Catalog([user_page(groups=(3, 9, 83)), user_page(groups=(9, 83))])
+    catalog.get_groups_page.return_value = PORTAL_GROUPS
+    instance = service(catalog)
+    instance.base_group_title = "Portal entry"
+    # The base role may already have been recorded as owned before opt-in.
+    await instance.group_ownership.set("1", "alice", {3, 83})
+    if operation == "departments":
+        await instance.handle_update_departments(UpdateUserDepartmentsDTO(reg="1", id="alice", departments=[]))
+    else:
+        await instance.handle_update(UpdateUserDTO(reg="1", uid="alice", grp=[]))
+    assert {int(v) for k, v in catalog.post_user.call_args.args[1] if k == "grp"} == {9, 83}
+    assert await instance.group_ownership.get("1", "alice") == set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("group_page,code", [
+    ('<a href="grp?grp=7">Ecology</a>', "USER_BASE_GROUP_NOT_FOUND"),
+    ('<a href="grp?grp=83">Portal</a><a href="grp?grp=84"> PORTAL </a>', "AMBIGUOUS_GROUP"),
+])
+@pytest.mark.parametrize("operation", ["create", "departments", "explicit_grp"])
+async def test_missing_or_ambiguous_portal_group_refuses_all_user_writes(group_page, code, operation):
+    catalog = Catalog([user_page()])
+    catalog.get_groups_page.return_value = group_page
+    instance = service(catalog)
+    instance.base_group_title = "Portal"
+    with pytest.raises(ParseError) as error:
+        if operation == "create":
+            await instance.handle_create(CreateUserDTO(reg="1", uid="alice", psw="password", departments=[]))
+        elif operation == "departments":
+            await instance.handle_update_departments(UpdateUserDepartmentsDTO(reg="1", id="alice", departments=[]))
+        else:
+            await instance.handle_update(UpdateUserDTO(reg="1", uid="alice", grp=[]))
+    assert error.value.code == code
+    catalog.post_user.assert_not_awaited()
+    catalog.create_group.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("title", ["Администратор ( webmaster )", "Administrators"])
+async def test_configured_portal_role_cannot_be_admin_group(title):
+    catalog = Catalog([])
+    catalog.get_groups_page.return_value = f'<a href="grp?grp=1">{title}</a>'
+    instance = service(catalog)
+    instance.base_group_title = title
+    with pytest.raises(ParseError) as error:
+        await instance.handle_create(CreateUserDTO(reg="1", uid="alice", psw="password", departments=[]))
+    assert error.value.code == "USER_BASE_GROUP_FORBIDDEN"
+    catalog.post_user.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_catalog_default_title_is_allowed_only_when_explicitly_configured():
+    title = "Пользователи Кодекс-клиента ( default )"
+    catalog = Catalog([None, user_page(groups=(83,))])
+    catalog.get_groups_page.return_value = f'<a href="grp?grp=83">{title}</a>'
+    instance = service(catalog)
+    instance.base_group_title = title
+    await instance.handle_create(CreateUserDTO(reg="1", uid="alice", psw="password", departments=[]))
+    assert [(k, v) for k, v in catalog.post_user.call_args.args[1] if k == "grp"] == [("grp", "83")]
+    assert await instance.group_ownership.get("1", "alice") == set()
+
+
+@pytest.mark.asyncio
+async def test_create_unions_explicit_groups_with_resolved_departments_not_template_defaults():
+    catalog = Catalog([None, user_page(groups=(7, 8))])
+    catalog.get_user_create_page.return_value = USER_TEMPLATE.replace("</form>", '<input type="checkbox" name="grp" value="1" checked></form>')
+    instance = service(catalog)
+    catalog.get_groups_page.return_value = '<a href="grp?grp=7">Ecology</a>'
+    instance.department_groups = StubDepartmentGroups({"stable-id": 7})
+    payload = CreateUserDTO(reg="1", uid="alice", psw="password", grp=[8, 7],
+        departments=[{"id": "stable-id", "title": "Display title may change"}])
+    await instance.handle_create(payload)
+    posted = catalog.post_user.call_args.args[1]
+    assert {int(v) for k, v in posted if k == "grp"} == {7, 8}
+    assert ("grp", "1") not in posted
+    assert await instance.group_ownership.get("1", "alice") == {7, 8}
+    assert payload.grp == [8, 7]
+
+
+@pytest.mark.asyncio
+async def test_explicit_empty_create_departments_grants_no_template_default_access():
+    catalog = Catalog([None, user_page(groups=())])
+    catalog.get_user_create_page.return_value = USER_TEMPLATE.replace("</form>", '<input type="checkbox" name="grp" value="1" checked></form>')
+    instance = service(catalog)
+    await instance.handle_create(CreateUserDTO(reg="1", uid="alice", psw="password", departments=[]))
+    assert not any(k == "grp" for k, v in catalog.post_user.call_args.args[1])
+    assert await instance.group_ownership.get("1", "alice") == set()
+
+
+@pytest.mark.asyncio
+async def test_create_department_retry_on_existing_user_preserves_manual_groups():
+    catalog = Catalog([None, user_page(groups=(7,)), user_page(groups=(7, 9))])
+    instance = service(catalog)
+    catalog.get_groups_page.return_value = '<a href="grp?grp=7">Ecology</a>'
+    instance.department_groups = StubDepartmentGroups({"department": 7})
+    payload = CreateUserDTO(reg="1", uid="alice", psw="password",
+        departments=[{"id": "department", "title": "Ecology"}])
+    original_fields = set(payload.model_fields_set)
+    await instance.handle_create(payload)
+    await instance.handle_create(payload)
+    assert catalog.post_user.await_count == 1
+    assert payload.model_fields_set == original_fields and payload.grp is None
+    assert await instance.group_ownership.get("1", "alice") == {7}
+
+
+@pytest.mark.asyncio
+async def test_create_existing_user_applies_resolved_groups_preserving_manual_membership():
+    catalog = Catalog([user_page(groups=(3, 9)), user_page(groups=(7, 8, 9))])
+    instance = service(catalog)
+    catalog.get_groups_page.return_value = '<a href="grp?grp=7">Ecology</a>'
+    instance.department_groups = StubDepartmentGroups({"department": 7})
+    await instance.group_ownership.set("1", "alice", {3})
+    await instance.handle_create(CreateUserDTO(reg="1", uid="alice", psw="password", grp=[8],
+        departments=[{"id": "department", "title": "Ecology"}]))
+    posted = catalog.post_user.call_args.args[1]
+    assert {int(v) for k, v in posted if k == "grp"} == {7, 8, 9}
+    assert ("hidden_setting", "keep") in posted
+    assert await instance.group_ownership.get("1", "alice") == {7, 8}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("explicit_grp", [False, True])
+async def test_legacy_create_without_departments_preserves_existing_grp_semantics(explicit_grp):
+    catalog = Catalog([user_page(groups=(3, 9))])
+    instance = service(catalog)
+    instance.department_groups.resolve = AsyncMock(side_effect=AssertionError("Legacy input must not resolve departments"))
+    fields = {"grp": [3, 9]} if explicit_grp else {}
+    await instance.handle_create(CreateUserDTO(reg="1", uid="alice", psw="password", **fields))
+    catalog.post_user.assert_not_awaited()
+    instance.department_groups.resolve.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("after", [None, user_page(uid="other"), USER_TEMPLATE])
 async def test_create_never_reports_unconfirmed_write(after):
     catalog = Catalog([None, after])

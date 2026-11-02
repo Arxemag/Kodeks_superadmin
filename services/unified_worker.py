@@ -274,7 +274,8 @@ async def run_unified_worker() -> None:
                                      headers=_default_headers()) as http_client:
             auth_client = AuthClient(http_client=http_client, auth_service_url=settings.AUTH_SERVICE_URL)
             catalog_client = CatalogClient(http_client=http_client)
-            user_service = UserService(auth_client=auth_client, catalog_client=catalog_client, reg_resolver=resolver)
+            user_service = UserService(auth_client=auth_client, catalog_client=catalog_client, reg_resolver=resolver,
+                                       base_group_title=settings.USER_BASE_GROUP_TITLE)
             store = EventStore(settings)
             async def dispatch(record, outbox_producer):
                 await _dispatch_record(record, user_service=user_service, resolver=resolver,

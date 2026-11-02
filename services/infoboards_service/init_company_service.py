@@ -66,7 +66,7 @@ class InitCompanyService:
     catalog_client: CatalogClient
     acl_ownership: AclOwnershipRepository = field(default_factory=AclOwnershipRepository)
 
-    async def handle(self, dto: InitCompanyDTO, *, dry_run: bool = False) -> None:
+    async def handle(self, dto: InitCompanyDTO, *, dry_run: bool = False) -> dict[str, list[str]] | None:
         """
         Полный flow init_company: БД sync, группы, ACL.
         При dry_run — только синхронизация таблицы маппинга (без HTTP к каталогу).
@@ -86,35 +86,55 @@ class InitCompanyService:
         logger.debug("_get_base_url(reg=%r) -> base_url=%r", reg, base_url)
 
         async with catalog_operation(base_url):
-            # Шаг 3: синхронизация таблицы маппинга
-            await self._sync_mapping_table(reg, dto)
-
             if dry_run:
+                await self._sync_mapping_table(reg, dto)
                 logger.info("dry_run: пропуск групп, boards, ACL")
                 return
 
             auth_service = AuthService(db=self.db, settings=self.settings)
             cookies = await auth_service.login(reg=reg, name=None)
 
+            # Resolve all requested modules before mapping/group/ACL writes.
+            required_titles = {title for department in dto.departments for title in department.modules}
+            deferred_titles = {normalize_title(title) for title in dto.deferred_cabinets}
+            boards_dict = await self._get_boards(base_url, cookies, required_titles=required_titles,
+                                                 optional_titles=deferred_titles)
+            found_titles = {normalize_title(title) for title in boards_dict}
+            missing_deferred = sorted({title.strip() for title in dto.deferred_cabinets
+                                       if normalize_title(title) not in found_titles}, key=normalize_title)
+            if missing_deferred:
+                logger.warning("DEFERRED_CABINETS reg=%r names=%s", reg, missing_deferred)
+                owned, _ = await self.acl_ownership.get(base_url, reg)
+                requested_fields = {
+                    field for board in boards_dict.values()
+                    for field in (f"acl_infoboard_{board.lower()}", f"acl_infoboard_{board.lower()}_view")
+                }
+                if unmentioned := owned.keys() - requested_fields:
+                    raise ParseError(
+                        code="DEFERRED_ACL_RECONCILIATION_REQUIRED",
+                        message=f"A partial cabinet snapshot cannot safely reconcile previously managed ACL fields: {sorted(unmentioned)!r}",
+                    )
+            logger.debug("_get_boards -> boards_count=%s mapping=%s", len(boards_dict), list(boards_dict.items())[:20])
+
+            await self._sync_mapping_table(reg, dto)
+
             # Шаг 4: синхронизация групп в сервисе
             groups_dict = await self._sync_groups(base_url, cookies, reg)
             logger.debug("_sync_groups -> groups_count=%s keys_sample=%s", len(groups_dict), list(groups_dict.keys())[:15])
-
-            # Шаг 5.1: получение кабинетов
-            boards_dict = await self._get_boards(base_url, cookies)
-            logger.debug("_get_boards -> boards_count=%s mapping=%s", len(boards_dict), list(boards_dict.items())[:20])
 
             # Шаг 5.2: формирование ACL-матрицы
             dep_id_to_modules = {str(d.id): d.modules for d in dto.departments}
             logger.debug("_build_acl_async input: reg=%r dep_id_to_modules=%s", reg, dep_id_to_modules)
             acl_matrix = await self._build_acl_async(
-                reg, groups_dict, boards_dict, dep_id_to_modules
+                reg, groups_dict, boards_dict, dep_id_to_modules, deferred_cabinets=deferred_titles
             )
             logger.debug("_build_acl_async -> acl_matrix=%s", acl_matrix)
 
             # Шаг 6: POST /admin/dirs
             logger.debug("_apply_acl input: base_url=%r acl_matrix=%s boards_dict_keys=%s", base_url, acl_matrix, list(boards_dict.keys()))
-            await self._apply_acl(base_url, cookies, acl_matrix, boards_dict, reg=reg)
+            await self._apply_acl(base_url, cookies, acl_matrix, boards_dict, reg=reg,
+                                  preserve_unmentioned_owned=bool(missing_deferred))
+            return {"deferred_cabinets": missing_deferred}
 
     async def _get_base_url(self, reg: str) -> str:
         """Base_url по reg; при отсутствии — AuthError REG_NOT_FOUND (DLQ)."""
@@ -160,13 +180,16 @@ class InitCompanyService:
         rows = list(res)
         existing = {r[1]: MappingRow(*r) for r in rows}
         logger.debug("_sync_mapping_table existing count=%s dept_ids=%s", len(existing), list(existing.keys()))
-        if not dto.departments and existing and not getattr(dto, "allow_empty_snapshot", False):
+        active = {department_id: row for department_id, row in existing.items() if row.mapping_status == "active"}
+        if not dto.departments and active and not getattr(dto, "allow_empty_snapshot", False):
             raise ParseError(code="EMPTY_DEPARTMENT_SNAPSHOT", message="Clearing existing departments requires allow_empty_snapshot=true")
-        if any(row.client_id != client_id for row in existing.values()):
+        if any(row.client_id != client_id for row in active.values()):
             raise ParseError(code="COMPANY_REG_CONFLICT", message="Registration is already mapped to a different platform company")
+        if any(department_id in existing and existing[department_id].client_id != client_id for department_id in incoming_ids):
+            raise ParseError(code="DEPARTMENT_OWNERSHIP_CONFLICT", message="An incoming department ID belongs to another company in this registration's history")
         has_company_name = "companyName" in dto.model_fields_set
         if not has_company_name:
-            company_name = next((row.client_name for row in existing.values() if row.client_name), "")
+            company_name = next((row.client_name for row in existing.values() if row.client_id == client_id and row.client_name), "")
 
         # 3.2 Обработка входящих departments
         for dept in dto.departments:
@@ -201,7 +224,7 @@ class InitCompanyService:
                 )
 
         # 3.3 Архивация удалённых отделов (department_id отсутствует в новом payload)
-        to_archive = existing.keys() - incoming_ids
+        to_archive = active.keys() - incoming_ids
         if to_archive:
             from sqlalchemy import bindparam
             stmt = text(f"""
@@ -332,11 +355,13 @@ class InitCompanyService:
                     raise ParseError(code="GROUP_RENAME_NOT_CONFIRMED", message=f"Catalog rename was not confirmed for group ID {group_id}")
             await self._save_group_binding(reg, department_id, group_id, by_id[group_id], origin)
         return groups
-    async def _get_boards(self, base_url: str, cookies: dict[str, str]) -> dict[str, str]:
+    async def _get_boards(self, base_url: str, cookies: dict[str, str], *, required_titles: set[str] | None = None,
+                          optional_titles: set[str] | None = None) -> dict[str, str]:
         """5.1: GraphQL board.many -> title -> id (через cabinet_acl.get_boards)."""
         logger.debug("_get_boards(base_url=%r)", base_url)
         try:
-            return await get_boards(base_url, self.http_client, cookies)
+            return await get_boards(base_url, self.http_client, cookies, required_titles=required_titles,
+                                    optional_titles=optional_titles)
         except NetworkError as e:
             if e.code == "GRAPHQL_FAILED":
                 raise NetworkError(
@@ -361,12 +386,17 @@ class InitCompanyService:
         groups_dict: dict[str, int],
         boards_dict: dict[str, str],
         dep_id_to_modules: dict[str, list[str]],
+        *,
+        deferred_cabinets: set[str] | None = None,
     ) -> dict[str, list[int]]:
         """5.2: board_id -> [group_ids]."""
         logger.debug(
             "_build_acl_async(reg=%r, groups_dict_len=%s, boards_dict_len=%s, dep_id_to_modules=%s)",
             reg, len(groups_dict), len(boards_dict), dep_id_to_modules,
         )
+        deferred = {normalize_title(title) for title in (deferred_cabinets or set())}
+        if "" in deferred:
+            raise ParseError(code="CABINET_DEFER_INVALID", message="Deferred cabinet title cannot be empty")
         group_index(groups_dict)  # Reject ambiguous catalog reads before planning.
         catalog_group_ids = set(groups_dict.values())
         normalized_boards = {}
@@ -397,6 +427,8 @@ class InitCompanyService:
                 board_id = normalized_boards.get(normalize_title(mod_title))
                 if board_id:
                     acl.setdefault(board_id, []).append(group_id)
+                elif normalize_title(mod_title) in deferred:
+                    continue
                 else:
                     raise ParseError(code="CABINET_NOT_FOUND", message=f"Required cabinet was not found: {mod_title!r}")
         for key in acl:
@@ -411,6 +443,7 @@ class InitCompanyService:
         boards_dict: dict[str, str],
         *,
         reg: str,
+        preserve_unmentioned_owned: bool = False,
     ) -> None:
         """Submit a complete known form, then confirm ACLs by a fresh read."""
         from urllib.parse import urlencode
@@ -418,6 +451,16 @@ class InitCompanyService:
         owned, owned_elsewhere = await self.acl_ownership.get(base_url, reg)
         if not acl_matrix and not owned:
             return
+        requested_fields = {
+            field
+            for board in acl_matrix
+            for field in (f"acl_infoboard_{board.lower()}", f"acl_infoboard_{board.lower()}_view")
+        }
+        if preserve_unmentioned_owned and (unmentioned := owned.keys() - requested_fields):
+            raise ParseError(
+                code="DEFERRED_ACL_RECONCILIATION_REQUIRED",
+                message=f"A partial cabinet snapshot cannot safely reconcile previously managed ACL fields: {sorted(unmentioned)!r}",
+            )
         next_owned = None
 
         async def prepare_fields(html: str) -> dict[str, list[int]]:

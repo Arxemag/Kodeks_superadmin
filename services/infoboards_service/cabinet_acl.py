@@ -52,8 +52,22 @@ async def get_boards(
     base_url: str,
     client: httpx.AsyncClient,
     cookies: dict[str, str],
+    *,
+    required_titles: list[str] | set[str] | None = None,
+    optional_titles: list[str] | set[str] | None = None,
 ) -> dict[str, str]:
-    """GraphQL board.many → словарь title -> id кабинета."""
+    """Read all boards, rejecting duplicate or absent titles used by this request.
+
+    With no filter the original strict contract remains: every duplicate in
+    the complete catalog is an error. A filter must still match exactly one
+    board per normalized requested title.
+    """
+    required = None if required_titles is None else {normalize_title(title) for title in required_titles}
+    optional = {normalize_title(title) for title in (optional_titles or [])}
+    if required is not None and "" in required:
+        raise ParseError(code="CABINET_NOT_FOUND", message="An empty cabinet title is not a valid module")
+    if "" in optional or (optional and (required is None or not optional <= required)):
+        raise ParseError(code="CABINET_DEFER_INVALID", message="Deferred titles must be nonempty requested modules")
     url = f"{base_url}/infoboard/graphql?context=docs"
     resp = await client.post(
         url,
@@ -87,10 +101,14 @@ async def get_boards(
             if not title or not board_id or item["title"] is None or item["id"] is None:
                 raise ValueError
             key = normalize_title(title)
+            if required is not None and key not in required:
+                continue
             if key in normalized and normalized[key] != board_id:
                 raise ParseError(code="AMBIGUOUS_CABINET", message=f"Several catalog cabinets match title {title!r}")
             normalized[key] = board_id
             result[title] = board_id
+        if required is not None and (missing := required - normalized.keys() - optional):
+            raise ParseError(code="CABINET_NOT_FOUND", message=f"Required cabinets were not found: {sorted(missing)!r}")
         return result
     except (KeyError, TypeError, ValueError, AttributeError) as error:
         raise ParseError(code="INFOBOARDS_PARSE_ERROR", message="Catalog did not return a complete valid cabinet list") from error

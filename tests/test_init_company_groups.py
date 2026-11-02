@@ -342,11 +342,234 @@ async def test_graphql_errors_are_not_an_empty_cabinet_list(service):
     assert caught.value.code == "INFOBOARDS_PARSE_ERROR"
 
 
+@pytest.mark.asyncio
+async def test_duplicate_unrequested_cabinet_names_do_not_block_requested_modules(service):
+    payload = {"data": {"board": {"many": [
+        {"title": "Руководитель производства", "id": "P001"},
+        {"title": "Рекомендованные документы", "id": "P002"},
+        {"title": "РЕКОМЕНДОВАННЫЕ\u00a0ДОКУМЕНТЫ", "id": "P003"},
+    ]}}}
+    service.http_client = SimpleNamespace(post=AsyncMock(return_value=SimpleNamespace(status_code=200, json=lambda: payload)))
+    assert await service._get_boards("https://catalog", {}, required_titles={"  РУКОВОДИТЕЛЬ  ПРОИЗВОДСТВА "}) == {
+        "Руководитель производства": "P001",
+    }
+
+
+@pytest.mark.asyncio
+async def test_duplicate_requested_cabinet_names_are_still_rejected(service):
+    payload = {"data": {"board": {"many": [
+        {"title": "Кабинет", "id": "P001"},
+        {"title": "КАБИНЕТ", "id": "P002"},
+    ]}}}
+    service.http_client = SimpleNamespace(post=AsyncMock(return_value=SimpleNamespace(status_code=200, json=lambda: payload)))
+    with pytest.raises(ParseError) as caught:
+        await service._get_boards("https://catalog", {}, required_titles={"кабинет"})
+    assert caught.value.code == "AMBIGUOUS_CABINET"
+
+
+@pytest.mark.asyncio
+async def test_missing_requested_cabinet_is_rejected_by_graph_lookup(service):
+    payload = {"data": {"board": {"many": [{"title": "Other", "id": "P001"}]}}}
+    service.http_client = SimpleNamespace(post=AsyncMock(return_value=SimpleNamespace(status_code=200, json=lambda: payload)))
+    with pytest.raises(ParseError) as caught:
+        await service._get_boards("https://catalog", {}, required_titles={"Missing"})
+    assert caught.value.code == "CABINET_NOT_FOUND"
+
+
+@pytest.mark.asyncio
+async def test_explicitly_deferred_cabinet_can_be_missing_but_other_required_is_returned(service):
+    payload = {"data": {"board": {"many": [{"title": "Production", "id": "P1"}]}}}
+    service.http_client = SimpleNamespace(post=AsyncMock(return_value=SimpleNamespace(status_code=200, json=lambda: payload)))
+    boards = await service._get_boards("https://catalog", {}, required_titles={"Production", "Кабинет СМК"},
+                                      optional_titles={" КАБИНЕТ\u00a0СМК "})
+    assert boards == {"Production": "P1"}
+
+
+@pytest.mark.asyncio
+async def test_deferred_cabinet_is_included_normally_when_it_exists(service):
+    payload = {"data": {"board": {"many": [
+        {"title": "Production", "id": "P1"}, {"title": "Кабинет СМК", "id": "P2"},
+    ]}}}
+    service.http_client = SimpleNamespace(post=AsyncMock(return_value=SimpleNamespace(status_code=200, json=lambda: payload)))
+    boards = await service._get_boards("https://catalog", {}, required_titles={"Production", "КАБИНЕТ СМК"},
+                                      optional_titles={"кабинет смк"})
+    assert boards == {"Production": "P1", "Кабинет СМК": "P2"}
+    service.db.execute.return_value = [("dept-id", 17)]
+    assert await service._build_acl_async("reg", {"Department": 17}, boards,
+                                        {"dept-id": ["Кабинет СМК"]}, deferred_cabinets={"кабинет смк"}) == {"P2": [17]}
+
+
+@pytest.mark.asyncio
+async def test_missing_non_deferred_cabinet_still_fails_when_another_is_deferred(service):
+    payload = {"data": {"board": {"many": [{"title": "Production", "id": "P1"}]}}}
+    service.http_client = SimpleNamespace(post=AsyncMock(return_value=SimpleNamespace(status_code=200, json=lambda: payload)))
+    with pytest.raises(ParseError) as caught:
+        await service._get_boards("https://catalog", {}, required_titles={"Production", "Кабинет СМК", "Other"},
+                                  optional_titles={"Кабинет СМК"})
+    assert caught.value.code == "CABINET_NOT_FOUND"
+    assert "other" in caught.value.message
+
+
+@pytest.mark.asyncio
+async def test_deferred_title_if_ambiguous_still_fails(service):
+    payload = {"data": {"board": {"many": [
+        {"title": "Кабинет СМК", "id": "P1"}, {"title": "КАБИНЕТ СМК", "id": "P2"},
+    ]}}}
+    service.http_client = SimpleNamespace(post=AsyncMock(return_value=SimpleNamespace(status_code=200, json=lambda: payload)))
+    with pytest.raises(ParseError) as caught:
+        await service._get_boards("https://catalog", {}, required_titles={"Кабинет СМК"}, optional_titles={"Кабинет СМК"})
+    assert caught.value.code == "AMBIGUOUS_CABINET"
+
+
+@pytest.mark.asyncio
+async def test_acl_planner_omits_only_explicitly_deferred_missing_cabinet(service):
+    service.db.execute.return_value = [("dept-id", 17)]
+    acl = await service._build_acl_async("reg", {"Department": 17}, {"Production": "P1"},
+                                         {"dept-id": ["Production", "Кабинет СМК"]}, deferred_cabinets={"КАБИНЕТ СМК"})
+    assert acl == {"P1": [17]}
+    with pytest.raises(ParseError) as caught:
+        await service._build_acl_async("reg", {"Department": 17}, {"Production": "P1"},
+                                       {"dept-id": ["Production", "Other"]}, deferred_cabinets={"Кабинет СМК"})
+    assert caught.value.code == "CABINET_NOT_FOUND"
+
+
+def test_deferred_cabinets_reject_blank_names():
+    from pydantic import ValidationError
+    with pytest.raises(ValidationError):
+        InitCompanyDTO(id=31, reg="reg", departments=[], deferred_cabinets=[" \u00a0 "])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('deferred_present', [False, True])
+async def test_handle_reports_only_actually_missing_deferred_cabinet(service, monkeypatch, deferred_present):
+    from contextlib import asynccontextmanager
+    from services.infoboards_service import init_company_service as company
+
+    @asynccontextmanager
+    async def lock(_base_url):
+        yield
+
+    monkeypatch.setattr(company, 'catalog_operation', lock)
+    monkeypatch.setattr(company, 'AuthService', lambda **kwargs: SimpleNamespace(login=AsyncMock(return_value={})))
+    service._get_base_url = AsyncMock(return_value='https://catalog')
+    service._sync_mapping_table = AsyncMock()
+    service._sync_groups = AsyncMock(return_value={'Department': 17})
+    service._build_acl_async = AsyncMock(return_value={'P1': [17]})
+    service._apply_acl = AsyncMock()
+    service.acl_ownership = SimpleNamespace(get=AsyncMock(return_value=({}, {})))
+    items = [{'title': 'Production', 'id': 'P1'}]
+    if deferred_present:
+        items.append({'title': 'Кабинет СМК', 'id': 'P2'})
+    payload = {'data': {'board': {'many': items}}}
+    service.http_client = SimpleNamespace(post=AsyncMock(return_value=SimpleNamespace(status_code=200, json=lambda: payload)))
+    dto = InitCompanyDTO(id=31, reg='reg', departments=[{
+        'id': 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 'title': 'Department',
+        'modules': ['Production', 'Кабинет СМК'],
+    }], deferred_cabinets=[' Кабинет\u00a0СМК '])
+    result = await service.handle(dto)
+    assert result == {'deferred_cabinets': [] if deferred_present else ['Кабинет\u00a0СМК']}
+    assert service._apply_acl.await_args.kwargs['preserve_unmentioned_owned'] is not deferred_present
+    assert service._build_acl_async.await_args.kwargs['deferred_cabinets'] == {'кабинет смк'}
+    board_map = service._build_acl_async.await_args.args[2]
+    assert ('Кабинет СМК' in board_map) is deferred_present
+
+
+@pytest.mark.asyncio
+async def test_deferred_allowlist_does_not_hide_unrelated_missing_module_before_writes(service, monkeypatch):
+    from contextlib import asynccontextmanager
+    from services.infoboards_service import init_company_service as company
+
+    @asynccontextmanager
+    async def lock(_base_url):
+        yield
+
+    monkeypatch.setattr(company, 'catalog_operation', lock)
+    monkeypatch.setattr(company, 'AuthService', lambda **kwargs: SimpleNamespace(login=AsyncMock(return_value={})))
+    service._get_base_url = AsyncMock(return_value='https://catalog')
+    service._sync_mapping_table = AsyncMock()
+    service._sync_groups = AsyncMock()
+    service._apply_acl = AsyncMock()
+    payload = {'data': {'board': {'many': [{'title': 'Production', 'id': 'P1'}]}}}
+    service.http_client = SimpleNamespace(post=AsyncMock(return_value=SimpleNamespace(status_code=200, json=lambda: payload)))
+    dto = InitCompanyDTO(id=31, reg='reg', departments=[{
+        'id': 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 'title': 'Department',
+        'modules': ['Production', 'Кабинет СМК', 'Another missing cabinet'],
+    }], deferred_cabinets=['Кабинет СМК'])
+    with pytest.raises(ParseError) as caught:
+        await service.handle(dto)
+    assert caught.value.code == 'CABINET_NOT_FOUND'
+    service._sync_mapping_table.assert_not_awaited()
+    service._sync_groups.assert_not_awaited()
+    service._apply_acl.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_deferred_unmentioned_owned_acl_stops_before_mapping_group_and_acl_writes(service, monkeypatch):
+    from contextlib import asynccontextmanager
+    from services.infoboards_service import init_company_service as company
+
+    @asynccontextmanager
+    async def lock(_base_url):
+        yield
+
+    monkeypatch.setattr(company, 'catalog_operation', lock)
+    monkeypatch.setattr(company, 'AuthService', lambda **kwargs: SimpleNamespace(login=AsyncMock(return_value={})))
+    service._get_base_url = AsyncMock(return_value='https://catalog')
+    service._sync_mapping_table = AsyncMock()
+    service._sync_groups = AsyncMock()
+    service._apply_acl = AsyncMock()
+    service.acl_ownership = SimpleNamespace(get=AsyncMock(return_value=({'acl_infoboard_p2': {7}}, {})))
+    payload = {'data': {'board': {'many': [{'title': 'Production', 'id': 'P1'}]}}}
+    service.http_client = SimpleNamespace(post=AsyncMock(return_value=SimpleNamespace(status_code=200, json=lambda: payload)))
+    dto = InitCompanyDTO(id=31, reg='reg', departments=[{
+        'id': 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 'title': 'Department',
+        'modules': ['Production', 'Кабинет СМК'],
+    }], deferred_cabinets=['Кабинет СМК'])
+    with pytest.raises(ParseError) as caught:
+        await service.handle(dto)
+    assert caught.value.code == 'DEFERRED_ACL_RECONCILIATION_REQUIRED'
+    service._sync_mapping_table.assert_not_awaited()
+    service._sync_groups.assert_not_awaited()
+    service._apply_acl.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unresolved_requested_cabinet_stops_before_all_mapping_group_and_acl_writes(service, monkeypatch):
+    from contextlib import asynccontextmanager
+    from services.infoboards_service import init_company_service as company
+
+    @asynccontextmanager
+    async def lock(_base_url):
+        yield
+
+    monkeypatch.setattr(company, "catalog_operation", lock)
+    monkeypatch.setattr(company, "AuthService", lambda **kwargs: SimpleNamespace(login=AsyncMock(return_value={})))
+    service._get_base_url = AsyncMock(return_value="https://catalog")
+    service._sync_mapping_table = AsyncMock()
+    service._sync_groups = AsyncMock()
+    service._apply_acl = AsyncMock()
+    payload = {"data": {"board": {"many": [{"title": "Other", "id": "P001"}]}}}
+    service.http_client = SimpleNamespace(post=AsyncMock(return_value=SimpleNamespace(status_code=200, json=lambda: payload)))
+    dto = InitCompanyDTO(id=31, reg="reg", departments=[{
+        "id": "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11", "title": "Department", "modules": ["Missing"],
+    }])
+    with pytest.raises(ParseError) as caught:
+        await service.handle(dto)
+    assert caught.value.code == "CABINET_NOT_FOUND"
+    service._sync_mapping_table.assert_not_awaited()
+    service._sync_groups.assert_not_awaited()
+    service._apply_acl.assert_not_awaited()
+
+
 DEPARTMENT_ID = "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"
 
 
 def mapping_row(client_id="1"):
     return (1, DEPARTMENT_ID, "Sales", "reg", client_id, "Existing Company", "active", 17, "Sales")
+
+
+def archived_mapping_row(client_id="24", department_id=DEPARTMENT_ID):
+    return (2, department_id, "Previous Department", "reg", client_id, "Previous Company", "archived", None, "Previous Department")
 
 
 @pytest.mark.asyncio
@@ -389,6 +612,54 @@ async def test_initial_empty_company_does_not_require_clear_permission(service):
 async def test_registration_cannot_be_reassigned_to_another_company_implicitly(service):
     service.db.execute.return_value = [mapping_row(client_id="2")]
     dto = InitCompanyDTO(id=1, reg="reg", departments=[{"id": DEPARTMENT_ID, "title": "Sales"}])
+    with pytest.raises(ParseError) as caught:
+        await service._sync_mapping_table("reg", dto)
+    assert caught.value.code == "COMPANY_REG_CONFLICT"
+    assert service.db.execute.await_count == 1
+    service.db.commit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_archived_previous_owner_does_not_block_new_active_owner(service):
+    new_department = "b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"
+    service.db.execute.return_value = [archived_mapping_row()]
+    dto = InitCompanyDTO(id=31, reg="reg", departments=[{"id": new_department, "title": "New Department"}])
+    await service._sync_mapping_table("reg", dto)
+    statements = service.db.execute.await_args_list
+    assert len(statements) == 2
+    assert "INSERT INTO" in str(statements[1].args[0])
+    assert statements[1].args[1]["dept_id"] == new_department
+    assert statements[1].args[1]["client_id"] == "31"
+    assert statements[1].args[1]["company_name"] == ""  # Never copy the old owner's name.
+    service.db.commit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_empty_snapshot_with_only_archived_history_never_archives_anything(service):
+    service.db.execute.return_value = [archived_mapping_row()]
+    await service._sync_mapping_table("reg", InitCompanyDTO(id=31, reg="reg", departments=[]))
+    assert service.db.execute.await_count == 1
+    service.db.commit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_incoming_department_cannot_reactivate_other_company_history(service):
+    service.db.execute.return_value = [archived_mapping_row()]
+    dto = InitCompanyDTO(id=31, reg="reg", departments=[{"id": DEPARTMENT_ID, "title": "New Department"}])
+    with pytest.raises(ParseError) as caught:
+        await service._sync_mapping_table("reg", dto)
+    assert caught.value.code == "DEPARTMENT_OWNERSHIP_CONFLICT"
+    assert service.db.execute.await_count == 1
+    service.db.commit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_old_owner_event_remains_blocked_after_new_owner_is_active(service):
+    old_department = DEPARTMENT_ID
+    new_department = "b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"
+    new_active = (3, new_department, "New Department", "reg", "31", "New Company", "active", None, "New Department")
+    service.db.execute.return_value = [archived_mapping_row(department_id=old_department), new_active]
+    dto = InitCompanyDTO(id=24, reg="reg", departments=[{"id": old_department, "title": "Previous Department"}])
     with pytest.raises(ParseError) as caught:
         await service._sync_mapping_table("reg", dto)
     assert caught.value.code == "COMPANY_REG_CONFLICT"

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from functools import wraps
+import re
 from typing import Any
 
 from common.exceptions import AuthError, NetworkError, ParseError
@@ -62,14 +63,48 @@ class UserService:
     reg_resolver: RegResolver
     group_ownership: GroupOwnershipRepository = field(default_factory=GroupOwnershipRepository)
     department_groups: DepartmentGroupRepository = field(default_factory=DepartmentGroupRepository)
+    base_group_title: str = ""
+
+    async def _base_group_ids(self, base_url, cookies, groups=None) -> set[int]:
+        title = normalize_title(self.base_group_title)
+        if not title:
+            return set()
+        # These built-in identities are not a portal entry role. The ID itself
+        # is always read from this catalog; no registration-specific IDs here.
+        if re.search(r"\b(admin|admins|administrator|administrators|webmaster)\b|администратор", title):
+            raise ParseError(code="USER_BASE_GROUP_FORBIDDEN", message="An administrative catalog group cannot be a portal entry role")
+        if groups is None:
+            groups = parse_groups_catalog(await self.catalog_client.get_groups_page(base_url, cookies))
+        index = group_index(groups)
+        if title not in index:
+            raise ParseError(code="USER_BASE_GROUP_NOT_FOUND", message="The configured portal entry group is absent from the catalog")
+        return {index[title]}
 
     @_serialized
     async def handle_create(self, payload: CreateUserDTO) -> None:
         """Создание пользователя: base_url и куки, проверка существования по get_user_page; при наличии — переход в _update_from_state, иначе POST с обязательными и опциональными полями."""
         logger.debug(f"handle_create payload={redact_payload(payload.model_dump(mode='python'))}")
+        resolved = set()
+        if "departments" in payload.model_fields_set:
+            # Resolve the complete explicit snapshot before any catalog write.
+            # Missing bindings remain retryable dependencies, never a successful
+            # creation without the requested access. Work on a copy so caller
+            # field-presence metadata retains its original meaning.
+            resolved = await self.department_groups.resolve(
+                payload.reg, [department.id for department in payload.departments or []],
+            )
+            payload = payload.model_copy(update={"grp": sorted(set(payload.grp or []) | resolved)})
         base_url = await self.reg_resolver.resolve_base_url(payload.reg)
         logger.debug(f"resolved base_url for create reg={payload.reg!r}: {base_url!r}")
         cookies = await self.auth_client.get_admin_cookies(payload.reg)
+        groups = None
+        if resolved or self.base_group_title.strip():
+            groups = parse_groups_catalog(await self.catalog_client.get_groups_page(base_url, cookies))
+            if not resolved <= set(groups.values()):
+                raise NetworkError(code="DEPARTMENT_GROUP_NOT_READY", message="Company synchronisation must restore missing catalog groups")
+        base_groups = await self._base_group_ids(base_url, cookies, groups)
+        if base_groups:
+            payload = payload.model_copy(update={"grp": sorted(set(payload.grp or []) | base_groups)})
 
         page = await self.catalog_client.get_user_page(base_url, payload.uid, cookies)
         absent = page is None
@@ -89,6 +124,7 @@ class UserService:
                 fallback_id=payload.uid,
                 base_url=base_url,
                 cookies=cookies,
+                base_group_ids=base_groups,
             )
             return
 
@@ -106,7 +142,7 @@ class UserService:
         await self._verify_user(base_url, payload.uid, cookies, replacements)
         if "grp" in replacements:
             try:
-                await self.group_ownership.set(payload.reg, payload.uid, set(payload.grp or []) - set(existing.groups))
+                await self.group_ownership.set(payload.reg, payload.uid, set(payload.grp or []) - set(existing.groups) - base_groups)
             except NetworkError as error:
                 raise ParseError(code="GROUP_OWNERSHIP_PERSIST_UNCERTAIN", message="User creation was verified but group ownership could not be recorded; reconcile before retrying") from error
         logger.debug(f"create completed uid={payload.uid!r}")
@@ -148,7 +184,8 @@ class UserService:
         groups_map = parse_groups_catalog(groups_page)
         logger.debug(f"parsed catalog groups count={len(groups_map)} titles_sample={list(groups_map.keys())[:8]!r}")
 
-        target_group_ids = sorted(await self.department_groups.resolve(payload.reg, [dep.id for dep in payload.departments]))
+        base_groups = await self._base_group_ids(base_url, cookies, groups_map)
+        target_group_ids = sorted(await self.department_groups.resolve(payload.reg, [dep.id for dep in payload.departments]) | base_groups)
         if not set(target_group_ids) <= set(groups_map.values()):
             raise NetworkError(code="DEPARTMENT_GROUP_NOT_READY", message="Company synchronisation must restore missing catalog groups")
 
@@ -174,6 +211,7 @@ class UserService:
             fallback_id=payload.id,
             base_url=base_url,
             cookies=cookies,
+            base_group_ids=base_groups,
         )
 
 
@@ -187,6 +225,7 @@ class UserService:
         fallback_id: str,
         base_url: str,
         cookies: dict[str, str],
+        base_group_ids: set[int] | None = None,
     ) -> None:
         """Сливает входящие поля с текущим состоянием, определяет id и grp; при отсутствии изменений выходит без POST; иначе формирует form_data и post_user."""
         merged: dict[str, str] = dict(existing.fields)
@@ -203,13 +242,15 @@ class UserService:
         id_value = existing.fields.get("id", "")
 
         if "grp" in fields_set:
-            desired = set(incoming.get("grp") or [])
+            if base_group_ids is None:
+                base_group_ids = await self._base_group_ids(base_url, cookies)
+            desired = set(incoming.get("grp") or []) | base_group_ids
             current = set(existing.groups)
             owned, owned_elsewhere = await self.group_ownership.get_with_shared(
                 reg, existing.fields["uid"], base_url, desired=desired, current=current,
             )
             grp_final = sorted((current - (owned - owned_elsewhere)) | desired)
-            next_owned = (owned & desired) | (desired - current) | (desired & owned_elsewhere)
+            next_owned = ((owned & desired) | (desired - current) | (desired & owned_elsewhere)) - base_group_ids
         else:
             grp_final = sorted(set(existing.groups))
 

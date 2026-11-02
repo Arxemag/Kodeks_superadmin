@@ -63,6 +63,14 @@ class InitCompanyDTO(BaseModel):
     companyName: str = ""
     departments: list[DepartmentPayload] = Field(default_factory=list)
     allow_empty_snapshot: bool = False
+    deferred_cabinets: list[str] = Field(default_factory=list)
+
+    @field_validator("deferred_cabinets")
+    @classmethod
+    def validate_deferred_cabinets(cls, titles: list[str]) -> list[str]:
+        if any(not title.strip() for title in titles):
+            raise ValueError("deferred_cabinets cannot contain blank titles")
+        return titles
 
 
 def is_missing_department_id_error(e: BaseException) -> bool:
