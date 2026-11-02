@@ -36,6 +36,7 @@ from services.infoboards_service.cabinet_acl import (
     get_boards,
 )
 from services.infoboards_service.dto import InitCompanyDTO
+from services.infoboards_service.cabinet_cascade import resolve_cabinet_cascades
 from services.users_service.catalog_client import CatalogClient
 from services.users_service.html_parser import group_index, normalize_title, parse_groups_catalog
 
@@ -99,16 +100,19 @@ class InitCompanyService:
             deferred_titles = {normalize_title(title) for title in dto.deferred_cabinets}
             boards_dict = await self._get_boards(base_url, cookies, required_titles=required_titles,
                                                  optional_titles=deferred_titles)
+            # Read the entire reachable graph before changing mappings, groups or ACLs.
+            cascades = await resolve_cabinet_cascades(
+                base_url, self.http_client, cookies, boards_dict.values(),
+            )
             found_titles = {normalize_title(title) for title in boards_dict}
             missing_deferred = sorted({title.strip() for title in dto.deferred_cabinets
                                        if normalize_title(title) not in found_titles}, key=normalize_title)
             if missing_deferred:
                 logger.warning("DEFERRED_CABINETS reg=%r names=%s", reg, missing_deferred)
                 owned, _ = await self.acl_ownership.get(base_url, reg)
-                requested_fields = {
-                    field for board in boards_dict.values()
-                    for field in (f"acl_infoboard_{board.lower()}", f"acl_infoboard_{board.lower()}_view")
-                }
+                requested_fields = {f"acl_infoboard_{board.lower()}" for board in boards_dict.values()}
+                requested_fields.update(f"acl_infoboard_{board.lower()}_view"
+                                        for cascade in cascades.values() for board in cascade)
                 if unmentioned := owned.keys() - requested_fields:
                     raise ParseError(
                         code="DEFERRED_ACL_RECONCILIATION_REQUIRED",
@@ -128,12 +132,19 @@ class InitCompanyService:
             acl_matrix = await self._build_acl_async(
                 reg, groups_dict, boards_dict, dep_id_to_modules, deferred_cabinets=deferred_titles
             )
+            view_acl_matrix: dict[str, list[int]] = {}
+            for root, group_ids in acl_matrix.items():
+                for board in sorted(cascades[root]):
+                    view_acl_matrix.setdefault(board, []).extend(group_ids)
+            view_acl_matrix = {board: list(dict.fromkeys(groups)) for board, groups in view_acl_matrix.items()}
+            logger.info("Cabinet access cascade reg=%r roots=%s boards=%s", reg, len(acl_matrix), len(view_acl_matrix))
             logger.debug("_build_acl_async -> acl_matrix=%s", acl_matrix)
 
             # Шаг 6: POST /admin/dirs
             logger.debug("_apply_acl input: base_url=%r acl_matrix=%s boards_dict_keys=%s", base_url, acl_matrix, list(boards_dict.keys()))
             await self._apply_acl(base_url, cookies, acl_matrix, boards_dict, reg=reg,
-                                  preserve_unmentioned_owned=bool(missing_deferred))
+                                  preserve_unmentioned_owned=bool(missing_deferred),
+                                  view_acl_matrix=view_acl_matrix)
             return {"deferred_cabinets": missing_deferred}
 
     async def _get_base_url(self, reg: str) -> str:
@@ -444,18 +455,18 @@ class InitCompanyService:
         *,
         reg: str,
         preserve_unmentioned_owned: bool = False,
+        view_acl_matrix: dict[str, list[int]] | None = None,
     ) -> None:
         """Submit a complete known form, then confirm ACLs by a fresh read."""
         from urllib.parse import urlencode
 
         owned, owned_elsewhere = await self.acl_ownership.get(base_url, reg)
-        if not acl_matrix and not owned:
+        # Existing root editing rules remain unchanged; only access cascades.
+        view_acl_matrix = acl_matrix if view_acl_matrix is None else view_acl_matrix
+        if not acl_matrix and not view_acl_matrix and not owned:
             return
-        requested_fields = {
-            field
-            for board in acl_matrix
-            for field in (f"acl_infoboard_{board.lower()}", f"acl_infoboard_{board.lower()}_view")
-        }
+        requested_fields = {f"acl_infoboard_{board.lower()}" for board in acl_matrix}
+        requested_fields.update(f"acl_infoboard_{board.lower()}_view" for board in view_acl_matrix)
         if preserve_unmentioned_owned and (unmentioned := owned.keys() - requested_fields):
             raise ParseError(
                 code="DEFERRED_ACL_RECONCILIATION_REQUIRED",
@@ -470,6 +481,7 @@ class InitCompanyService:
             desired = {}
             for board, group_ids in acl_matrix.items():
                 desired[f"acl_infoboard_{board.lower()}"] = set(group_ids)
+            for board, group_ids in view_acl_matrix.items():
                 desired[f"acl_infoboard_{board.lower()}_view"] = set(group_ids)
             overrides, next_owned = plan_acl_assignments(current, owned, desired, owned_elsewhere)
             return overrides

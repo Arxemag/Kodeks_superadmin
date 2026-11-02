@@ -20,10 +20,10 @@ A = "acl_infoboard_p1"
 V = "acl_infoboard_p1_view"
 
 
-def form(access=(), view=(), *, second=None):
+def form(access=(), view=(), *, second=None, second_view=None):
     fields = [(A, access), (V, view)]
     if second is not None:
-        fields.extend([("acl_infoboard_p2", second), ("acl_infoboard_p2_view", second)])
+        fields.extend([("acl_infoboard_p2", second), ("acl_infoboard_p2_view", second if second_view is None else second_view)])
     html = '<form action="/admin/dirs"><input name=unrelated value="">'
     for name, ids in fields:
         html += f'<input type=hidden name="{name}" value="{escape(json.dumps({"kw": [str(i) for i in ids]}), quote=True)}">'
@@ -41,6 +41,31 @@ def configure(monkeypatch):
         client = SimpleNamespace(post=AsyncMock(return_value=SimpleNamespace(status_code=200)))
         return company.InitCompanyService(None, None, client, None, repo), repo, client, fetch
     return setup
+
+
+@pytest.mark.asyncio
+async def test_cascade_adds_only_child_access_preserving_edit_and_manual_rights(configure):
+    service, repo, client, _ = configure(
+        form((3, 99), (3, 98), second=(7,)),
+        form((3, 99), (3, 98), second=(7,), second_view=(3, 7)),
+        {A: {3}, V: {3}},
+    )
+    await service._apply_acl('https://catalog', {}, {'P1': [3]}, {}, reg='reg-a',
+                             view_acl_matrix={'P1': [3], 'P2': [3]}, preserve_unmentioned_owned=True)
+    sent = parse_qsl(client.post.await_args.kwargs['content'], keep_blank_values=True)
+    assert acl_values(sent)['acl_infoboard_p2']['kw'] == ['7']
+    assert set(acl_values(sent)['acl_infoboard_p2_view']['kw']) == {'3', '7'}
+    repo.replace.assert_awaited_once_with('https://catalog', 'reg-a', {A: {3}, V: {3}, 'acl_infoboard_p2_view': {3}})
+
+
+@pytest.mark.asyncio
+async def test_repeated_cascade_with_deferred_root_is_noop(configure):
+    owned = {A: {3}, V: {3}, 'acl_infoboard_p2_view': {3}}
+    service, repo, client, _ = configure(form((3, 99), (3, 98), second=(7,), second_view=(3, 7)), owned=owned)
+    await service._apply_acl('https://catalog', {}, {'P1': [3]}, {}, reg='reg-a',
+                             view_acl_matrix={'P1': [3], 'P2': [3]}, preserve_unmentioned_owned=True)
+    client.post.assert_not_awaited()
+    repo.replace.assert_awaited_once_with('https://catalog', 'reg-a', owned)
 
 
 @pytest.mark.asyncio
@@ -78,6 +103,29 @@ async def test_previously_managed_board_removed_from_desired_is_cleaned(configur
     )
     await service._apply_acl("https://catalog", {}, {"P2": [7]}, {}, reg="reg-a")
     repo.replace.assert_awaited_once_with("https://catalog", "reg-a", {})
+
+
+@pytest.mark.asyncio
+async def test_partial_snapshot_with_unmentioned_owned_cabinet_requires_reconciliation(configure):
+    service, repo, client, fetch = configure(form((99,), (98,), second=(7,)), owned={
+        "acl_infoboard_p2": {7}, "acl_infoboard_p2_view": {7},
+    })
+    with pytest.raises(ParseError) as caught:
+        await service._apply_acl("https://catalog", {}, {"P1": [3]}, {}, reg="reg-a", preserve_unmentioned_owned=True)
+    assert caught.value.code == "DEFERRED_ACL_RECONCILIATION_REQUIRED"
+    client.post.assert_not_awaited()
+    fetch.assert_not_awaited()
+    repo.replace.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_partial_snapshot_still_removes_unwanted_owned_groups_from_desired_cabinet(configure):
+    service, repo, client, _ = configure(form((1, 99), (1, 98)), form((3, 99), (3, 98)), {A: {1}, V: {1}})
+    await service._apply_acl("https://catalog", {}, {"P1": [3]}, {}, reg="reg-a", preserve_unmentioned_owned=True)
+    sent = parse_qsl(client.post.await_args.kwargs["content"], keep_blank_values=True)
+    assert set(acl_values(sent)[A]["kw"]) == {"3", "99"}
+    assert set(acl_values(sent)[V]["kw"]) == {"3", "98"}
+    repo.replace.assert_awaited_once_with("https://catalog", "reg-a", {A: {3}, V: {3}})
 
 
 @pytest.mark.asyncio

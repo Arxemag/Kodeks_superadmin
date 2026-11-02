@@ -19,7 +19,11 @@ def groups_page(*groups: tuple[int, str]) -> str:
 
 
 @pytest.fixture
-def service() -> InitCompanyService:
+def service(monkeypatch) -> InitCompanyService:
+    # These service tests isolate graph reads; traversal is covered separately.
+    async def root_cascades(base, client, cookies, roots):
+        return {root: {root} for root in roots}
+    monkeypatch.setattr('services.infoboards_service.init_company_service.resolve_cabinet_cascades', root_cascades)
     instance = InitCompanyService(
         db=SimpleNamespace(execute=AsyncMock(), commit=AsyncMock(), rollback=AsyncMock()),
         settings=SimpleNamespace(DB_TABLE_DEPARTMENT_MAPPING="department_service_mapping", DB_TABLE_REG_SERVICES="reg_services"),
@@ -472,6 +476,64 @@ async def test_handle_reports_only_actually_missing_deferred_cabinet(service, mo
     assert service._build_acl_async.await_args.kwargs['deferred_cabinets'] == {'кабинет смк'}
     board_map = service._build_acl_async.await_args.args[2]
     assert ('Кабинет СМК' in board_map) is deferred_present
+
+
+@pytest.mark.asyncio
+async def test_handle_cascades_access_unions_shared_children_and_keeps_edit_at_roots(service, monkeypatch):
+    from contextlib import asynccontextmanager
+    from services.infoboards_service import init_company_service as company
+
+    @asynccontextmanager
+    async def lock(_base_url):
+        yield
+
+    monkeypatch.setattr(company, 'catalog_operation', lock)
+    monkeypatch.setattr(company, 'AuthService', lambda **kwargs: SimpleNamespace(login=AsyncMock(return_value={})))
+    resolver = AsyncMock(return_value={'P1': {'P1', 'P3', 'P4'}, 'P2': {'P2', 'P4'}})
+    monkeypatch.setattr(company, 'resolve_cabinet_cascades', resolver)
+    service._get_base_url = AsyncMock(return_value='https://catalog')
+    service._get_boards = AsyncMock(return_value={'Root A': 'P1', 'Root B': 'P2'})
+    service._sync_mapping_table = AsyncMock()
+    service._sync_groups = AsyncMock(return_value={'A': 17, 'B': 18})
+    service._build_acl_async = AsyncMock(return_value={'P1': [17], 'P2': [18]})
+    service._apply_acl = AsyncMock()
+    # This previously owned child must not trip the deferred-SMK guard.
+    service.acl_ownership = SimpleNamespace(get=AsyncMock(return_value=({'acl_infoboard_p3_view': {17}}, {})))
+    dto = InitCompanyDTO(id=31, reg='reg', departments=[{
+        'id': 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 'title': 'A',
+        'modules': ['Root A', 'Root B', 'Кабинет СМК'],
+    }], deferred_cabinets=['Кабинет СМК'])
+    await service.handle(dto)
+    assert service._apply_acl.await_args.args[2] == {'P1': [17], 'P2': [18]}
+    assert service._apply_acl.await_args.kwargs['view_acl_matrix'] == {
+        'P1': [17], 'P2': [18], 'P3': [17], 'P4': [17, 18],
+    }
+    assert set(resolver.await_args.args[3]) == {'P1', 'P2'}
+
+
+@pytest.mark.asyncio
+async def test_graph_failure_prevents_every_business_write(service, monkeypatch):
+    from contextlib import asynccontextmanager
+    from services.infoboards_service import init_company_service as company
+
+    @asynccontextmanager
+    async def lock(_base_url):
+        yield
+
+    monkeypatch.setattr(company, 'catalog_operation', lock)
+    monkeypatch.setattr(company, 'AuthService', lambda **kwargs: SimpleNamespace(login=AsyncMock(return_value={})))
+    monkeypatch.setattr(company, 'resolve_cabinet_cascades', AsyncMock(side_effect=ParseError(code='BOARD_NOT_FOUND', message='child missing')))
+    service._get_base_url = AsyncMock(return_value='https://catalog')
+    service._get_boards = AsyncMock(return_value={'Root': 'P1'})
+    service._sync_mapping_table = AsyncMock()
+    service._sync_groups = AsyncMock()
+    service._apply_acl = AsyncMock()
+    dto = InitCompanyDTO(id=31, reg='reg', departments=[])
+    with pytest.raises(ParseError, match='child missing'):
+        await service.handle(dto)
+    service._sync_mapping_table.assert_not_awaited()
+    service._sync_groups.assert_not_awaited()
+    service._apply_acl.assert_not_awaited()
 
 
 @pytest.mark.asyncio
