@@ -107,8 +107,9 @@ async def healthcheck_schema() -> None:
             await session.execute(text("SELECT reg, user_uid, group_ids FROM catalog_user_group_ownership LIMIT 0"))
             await session.execute(text("SELECT id, status, payload, available_at FROM integration_events LIMIT 0"))
             await session.execute(text("SELECT id, payload, sent_at FROM integration_outbox LIMIT 0"))
-            await session.execute(text("SELECT catalog_url, reg, control_name, group_ids FROM catalog_acl_ownership LIMIT 0"))
+            await session.execute(text("SELECT catalog_url, reg, source, control_name, group_ids FROM catalog_acl_ownership LIMIT 0"))
             await session.execute(text("SELECT catalog_url, board_id, reg, archive, pending FROM catalog_cabinet_widget_state LIMIT 0"))
+            await session.execute(text("SELECT catalog_url, branch_id, reg, root_id, group_id, boards, tracked_uids FROM catalog_cabinet_editor_groups LIMIT 0"))
     except Exception as error:
         raise DatabaseError(code="DB_SCHEMA_NOT_READY", message="Application tables are not ready", http_status=503) from error
 

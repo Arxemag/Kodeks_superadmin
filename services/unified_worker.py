@@ -227,7 +227,7 @@ async def _outbox_loop(store, producer, settings, stop_event):
             await _idle(stop_event, settings.INTEGRATION_POLL_SECONDS)
 
 
-async def _run_pipeline(consumer, producer, store, dispatch, settings, stop_event):
+async def _run_pipeline(consumer, producer, store, dispatch, settings, stop_event, *, editor_sync=None):
     # Each executor may need its journal connection, catalog-lock connection and
     # a service DB connection. Leave room for intake/publisher in the same pool.
     count = min(settings.INTEGRATION_EXECUTOR_CONCURRENCY, max(1, (settings.POOL_SIZE - 2) // 3))
@@ -237,6 +237,8 @@ async def _run_pipeline(consumer, producer, store, dispatch, settings, stop_even
             tasks = [group.create_task(_intake_loop(consumer, store, settings, stop_event)),
                      group.create_task(_outbox_loop(store, producer, settings, stop_event))]
             tasks.extend(group.create_task(_executor_loop(store, dispatch, settings, stop_event)) for _ in range(count))
+            if editor_sync is not None:
+                tasks.append(group.create_task(editor_sync()))
             unified_worker_ready.set(1)
             await stop_event.wait()
             try:
@@ -283,7 +285,17 @@ async def run_unified_worker() -> None:
                                        producer=outbox_producer, settings=settings)
             await producer.start()
             await consumer.start()
-            await _run_pipeline(consumer, producer, store, dispatch, settings, stop_event)
+            editor_sync = None
+            if settings.EDITOR_SYNC_REGS:
+                from services.infoboards_service.editor_service import EditorService, run_editor_sync
+
+                regs = tuple(dict.fromkeys(reg.strip() for reg in settings.EDITOR_SYNC_REGS.split(",")))
+                editor_service = EditorService(settings, resolver, user_service)
+
+                async def editor_sync():
+                    await run_editor_sync(editor_service, regs, stop_event)
+
+            await _run_pipeline(consumer, producer, store, dispatch, settings, stop_event, editor_sync=editor_sync)
     finally:
         unified_worker_ready.set(0)
         try:

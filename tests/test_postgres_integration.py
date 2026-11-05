@@ -99,6 +99,40 @@ async def test_real_db_sync_mapping_with_varchar_and_text_titles(postgres):
 
 
 @pytest.mark.asyncio
+async def test_real_db_acl_source_migration_and_same_reg_isolation(postgres, monkeypatch):
+    from common import acl_ownership
+    from common.acl_ownership import AclOwnershipRepository, plan_acl_assignments
+
+    async with postgres.engine.connect() as connection:
+        # The temporary table shadows any application table on this connection.
+        create = Path('scripts/migrations/008_catalog_acl_ownership.sql').read_text(encoding='utf-8')
+        create = create.replace('CREATE TABLE IF NOT EXISTS', 'CREATE TEMP TABLE')
+        await connection.execute(text(create))
+        await connection.execute(text("""INSERT INTO catalog_acl_ownership
+            (catalog_url, reg, control_name, group_ids)
+            VALUES ('https://catalog/', '31', 'acl_infoboard_p1', '[1,2]'::jsonb)"""))
+        raw = await connection.get_raw_connection()
+        await raw.driver_connection.execute(Path('scripts/migrations/010_catalog_acl_source.sql').read_text(encoding='utf-8'))
+        await connection.commit()
+
+        @asynccontextmanager
+        async def sessions():
+            async with AsyncSession(bind=connection, expire_on_commit=False) as session:
+                yield session
+
+        monkeypatch.setattr(acl_ownership, 'get_db_session', sessions)
+        departments, editors = AclOwnershipRepository(), AclOwnershipRepository('editors')
+        field, url = 'acl_infoboard_p1', 'https://catalog/'
+        assert await departments.get(url, '31') == ({field: {1, 2}}, {})
+        await editors.replace(url, '31', {field: {2, 3}})
+        owned, elsewhere = await departments.get(url, '31')
+        assert (owned, elsewhere) == ({field: {1, 2}}, {field: {2, 3}})
+        assert plan_acl_assignments({field: {1, 2, 3}}, owned, {}, elsewhere)[0] == {field: [2, 3]}
+        await departments.replace(url, '31', {})
+        assert await editors.get(url, '31') == ({field: {2, 3}}, {})
+
+
+@pytest.mark.asyncio
 async def test_real_db_ingest_dedup_conflict_and_atomic_outbox(postgres):
     pg = postgres
     item = event(pg, {'event_id': 'source-id', 'payload': {'reg': '123', 'uid': 'alice'}})

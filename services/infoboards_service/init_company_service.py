@@ -456,6 +456,7 @@ class InitCompanyService:
         reg: str,
         preserve_unmentioned_owned: bool = False,
         view_acl_matrix: dict[str, list[int]] | None = None,
+        exclusive_edit: dict[str, set[int]] | None = None,
     ) -> None:
         """Submit a complete known form, then confirm ACLs by a fresh read."""
         from urllib.parse import urlencode
@@ -463,7 +464,7 @@ class InitCompanyService:
         owned, owned_elsewhere = await self.acl_ownership.get(base_url, reg)
         # Existing root editing rules remain unchanged; only access cascades.
         view_acl_matrix = acl_matrix if view_acl_matrix is None else view_acl_matrix
-        if not acl_matrix and not view_acl_matrix and not owned:
+        if not acl_matrix and not view_acl_matrix and not owned and not exclusive_edit:
             return
         requested_fields = {f"acl_infoboard_{board.lower()}" for board in acl_matrix}
         requested_fields.update(f"acl_infoboard_{board.lower()}_view" for board in view_acl_matrix)
@@ -478,12 +479,27 @@ class InitCompanyService:
             nonlocal next_owned
             pairs = parse_form_pairs(html, acl=True, include_save=True)
             current = {name: {int(group) for group in value["kw"]} for name, value in acl_values(pairs).items()}
+            active_fields = {f"acl_{name}" for name, _ in pairs if name.startswith("infoboard_")}
             desired = {}
             for board, group_ids in acl_matrix.items():
                 desired[f"acl_infoboard_{board.lower()}"] = set(group_ids)
             for board, group_ids in view_acl_matrix.items():
-                desired[f"acl_infoboard_{board.lower()}_view"] = set(group_ids)
+                field = f"acl_infoboard_{board.lower()}_view"
+                if exclusive_edit is None or field in active_fields:
+                    desired[field] = set(group_ids)
             overrides, next_owned = plan_acl_assignments(current, owned, desired, owned_elsewhere)
+            if exclusive_edit is not None:
+                # Editor access must not enable a restriction on a public page.
+                overrides = {name: groups for name, groups in overrides.items()
+                             if not name.endswith("_view") or name in active_fields}
+                for board, permitted in exclusive_edit.items():
+                    field = f"acl_infoboard_{board.lower()}"
+                    if not permitted or field not in current or (owned_elsewhere.get(field, set()) - permitted):
+                        raise ParseError(code="EDITOR_ACL_CONFLICT", message=f"Cannot exclusively manage editing on {board!r}")
+                    overrides[field] = sorted(permitted)
+                # The editor source uses reserved groups created by the integration.
+                # A previously applied write is still owned if its response was lost.
+                next_owned = {name: groups for name, groups in desired.items() if groups}
             return overrides
 
         setup_html, post_url, _base, docs_n = await fetch_acl_form_via_http(

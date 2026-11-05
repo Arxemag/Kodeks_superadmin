@@ -33,7 +33,7 @@ def plan_acl_assignments(
     current: dict[str, set[int]], owned: dict[str, set[int]], desired: dict[str, set[int]],
     owned_elsewhere: dict[str, set[int]] | None = None,
 ) -> tuple[dict[str, list[int]], dict[str, set[int]]]:
-    """Preserve manual grants and grants managed by other registrations."""
+    """Preserve manual grants and grants managed by other registrations or sources."""
     overrides = {}
     next_owned = {}
     owned_elsewhere = owned_elsewhere or {}
@@ -53,12 +53,17 @@ def plan_acl_assignments(
 
 
 class AclOwnershipRepository:
+    def __init__(self, source: str = "departments") -> None:
+        if not isinstance(source, str) or not re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", source):
+            raise ParseError(code="ACL_OWNERSHIP_INVALID", message="Invalid ACL ownership source")
+        self.source = source
+
     async def get(self, base_url: str, reg: str) -> tuple[dict[str, set[int]], dict[str, set[int]]]:
         catalog_url = canonical_catalog_url(base_url)
         try:
             async with get_db_session() as session:
                 result = await session.execute(
-                    text("SELECT reg, control_name, group_ids FROM catalog_acl_ownership WHERE catalog_url = :catalog_url"),
+                    text("SELECT reg, source, control_name, group_ids FROM catalog_acl_ownership WHERE catalog_url = :catalog_url"),
                     {"catalog_url": catalog_url},
                 )
                 rows = list(result)
@@ -66,7 +71,9 @@ class AclOwnershipRepository:
             raise NetworkError(code="ACL_OWNERSHIP_READ_FAILED", message="Cannot read confirmed ACL ownership") from error
         ownership = {}
         elsewhere = {}
-        for row_reg, name, values in rows:
+        for row_reg, row_source, name, values in rows:
+            if not isinstance(row_source, str) or not re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", row_source):
+                raise ParseError(code="ACL_OWNERSHIP_INVALID", message="Invalid stored ACL ownership source")
             _field(name)
             if isinstance(values, str):
                 try:
@@ -75,7 +82,7 @@ class AclOwnershipRepository:
                     raise ParseError(code="ACL_OWNERSHIP_INVALID", message="Stored ACL ownership is not valid JSON") from error
             if not isinstance(values, list):
                 raise ParseError(code="ACL_OWNERSHIP_INVALID", message="Stored ACL ownership must be a JSON array")
-            target = ownership if row_reg == reg else elsewhere
+            target = ownership if row_reg == reg and row_source == self.source else elsewhere
             target.setdefault(name, set()).update(_ids(values))
         return ownership, elsewhere
 
@@ -91,13 +98,13 @@ class AclOwnershipRepository:
             async with get_db_session() as session:
                 async with session.begin():
                     await session.execute(
-                        text("DELETE FROM catalog_acl_ownership WHERE catalog_url = :catalog_url AND reg = :reg"),
-                        {"catalog_url": catalog_url, "reg": reg},
+                        text("DELETE FROM catalog_acl_ownership WHERE catalog_url = :catalog_url AND reg = :reg AND source = :source"),
+                        {"catalog_url": catalog_url, "reg": reg, "source": self.source},
                     )
                     for name, ids in values.items():
                         await session.execute(
-                            text("INSERT INTO catalog_acl_ownership (catalog_url, reg, control_name, group_ids) VALUES (:catalog_url, :reg, :name, CAST(:group_ids AS jsonb))"),
-                            {"catalog_url": catalog_url, "reg": reg, "name": name, "group_ids": json.dumps(ids)},
+                            text("INSERT INTO catalog_acl_ownership (catalog_url, reg, source, control_name, group_ids) VALUES (:catalog_url, :reg, :source, :name, CAST(:group_ids AS jsonb))"),
+                            {"catalog_url": catalog_url, "reg": reg, "source": self.source, "name": name, "group_ids": json.dumps(ids)},
                         )
         except SQLAlchemyError as error:
             raise NetworkError(code="ACL_OWNERSHIP_WRITE_FAILED", message="Cannot store verified ACL ownership") from error

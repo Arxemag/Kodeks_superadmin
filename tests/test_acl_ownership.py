@@ -301,7 +301,7 @@ def repository_db(monkeypatch):
 @pytest.mark.asyncio
 async def test_repository_uses_canonical_catalog_and_independent_controls(repository_db):
     session, events = repository_db
-    session.execute.return_value = [("reg-a", A, [1]), ("reg-b", V, "[2]")]
+    session.execute.return_value = [("reg-a", "departments", A, [1]), ("reg-b", "departments", V, "[2]")]
     assert await AclOwnershipRepository().get("HTTPS://CATALOG:443", "reg-a") == ({A: {1}}, {V: {2}})
     assert session.execute.await_args.args[1] == {"catalog_url": "https://catalog/"}
     await AclOwnershipRepository().replace("https://catalog/", "reg-a", {A: {1}, V: {2}})
@@ -309,8 +309,37 @@ async def test_repository_uses_canonical_catalog_and_independent_controls(reposi
     inserts = session.execute.await_args_list[-2:]
     assert {call.args[1]["name"] for call in inserts} == {A, V}
     assert all(call.args[1]["reg"] == "reg-a" for call in inserts)
+    assert all(call.args[1]["source"] == "departments" for call in inserts)
     delete = session.execute.await_args_list[-3]
     assert "AND reg = :reg" in str(delete.args[0])
+    assert "AND source = :source" in str(delete.args[0])
+
+
+@pytest.mark.asyncio
+async def test_same_reg_editor_source_is_shared_and_not_deleted(repository_db):
+    session, _ = repository_db
+    session.execute.return_value = [
+        ("reg-a", "departments", A, [1, 2]),
+        ("reg-a", "editors", A, [2, 3]),
+        ("reg-b", "departments", A, [4]),
+    ]
+    departments = AclOwnershipRepository()
+    owned, other = await departments.get("https://catalog", "reg-a")
+    assert owned == {A: {1, 2}}
+    assert other == {A: {2, 3, 4}}
+    overrides, next_owned = plan_acl_assignments({A: {1, 2, 3, 4}}, owned, {}, other)
+    assert overrides == {A: [2, 3, 4]}
+    assert next_owned == {}
+    await departments.replace("https://catalog", "reg-a", next_owned)
+    assert session.execute.await_args.args[1]["source"] == "departments"
+    assert await AclOwnershipRepository("editors").get("https://catalog", "reg-a") == ({A: {2, 3}}, {A: {1, 2, 4}})
+
+
+@pytest.mark.parametrize("source", ["", " ", "Editors", "a b", "a" * 65])
+def test_repository_rejects_invalid_source(source):
+    with pytest.raises(ParseError) as caught:
+        AclOwnershipRepository(source)
+    assert caught.value.code == "ACL_OWNERSHIP_INVALID"
 
 
 @pytest.mark.asyncio
@@ -327,7 +356,7 @@ async def test_repository_replace_failure_rolls_back_and_is_retryable(repository
 @pytest.mark.parametrize("bad", ["{}", "[true]", "[1.5]", "not-json"])
 async def test_repository_rejects_corrupt_metadata_instead_of_ignoring_it(repository_db, bad):
     session, _ = repository_db
-    session.execute.return_value = [("reg-a", A, bad)]
+    session.execute.return_value = [("reg-a", "departments", A, bad)]
     with pytest.raises(ParseError) as caught:
         await AclOwnershipRepository().get("https://catalog", "reg-a")
     assert caught.value.code == "ACL_OWNERSHIP_INVALID"

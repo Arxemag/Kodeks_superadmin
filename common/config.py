@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 from functools import lru_cache
 
-from pydantic import Field, model_validator
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine import URL
 
@@ -52,6 +52,9 @@ class Settings(BaseSettings):
     ACL_WRITE_TIMEOUT: float = Field(60.0, gt=0, allow_inf_nan=False, description="ACL save HTTP timeout seconds; uncertain writes require reconciliation")
     CATALOG_LOCK_TIMEOUT: float = Field(30.0, gt=0, description="Catalog database lock wait timeout seconds")
     USER_BASE_GROUP_TITLE: str = Field("", description="Opt-in native non-admin group for portal entry; resolved by unique title per catalog")
+    EDITOR_PORTAL_DB_URL: SecretStr = SecretStr("")
+    EDITOR_SYNC_REGS: str = ""
+    EDITOR_SYNC_SECONDS: float = Field(30, ge=5, le=3600)
     LOG_LEVEL: str = Field("INFO", description="Log level")
     CHROMIUM_WS_ENDPOINT: str = Field(
         "",
@@ -192,6 +195,11 @@ class Settings(BaseSettings):
         """
         if self.SSO_ENABLED and not self.SSO_API_TOKEN.strip():
             raise ValueError("SSO_API_TOKEN is required when SSO_ENABLED=true")
+        editor_regs = self.EDITOR_SYNC_REGS.split(",") if self.EDITOR_SYNC_REGS else []
+        if any(not re.fullmatch(r"[0-9]+", reg.strip()) for reg in editor_regs):
+            raise ValueError("EDITOR_SYNC_REGS must contain comma-separated registration numbers")
+        if editor_regs and not self.EDITOR_PORTAL_DB_URL.get_secret_value():
+            raise ValueError("EDITOR_PORTAL_DB_URL is required when EDITOR_SYNC_REGS is configured")
         if not self.KAFKA_BOOTSTRAP_SERVERS:
             self.KAFKA_BOOTSTRAP_SERVERS = self.KAFKA_BROKER or "127.0.0.1:9092"
 
