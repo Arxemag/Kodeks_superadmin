@@ -24,10 +24,12 @@ from dataclasses import dataclass, field
 from json import JSONDecodeError
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
 from common.exceptions import NetworkError, ParseError
+from common.cabinet_widget_state import CabinetWidgetState, CabinetWidgetStateRepository
 from common.logger import get_logger
 
 
@@ -56,8 +58,12 @@ query QueryBoardOne($id: String!) {
   board {
     one(id: $id) {
       id
+      boardUuid
       author
       title
+      background backgroundFilename icons background2 background2Filename disableBackgroundBlur
+      logo logoFilename logo2 logo2Filename hiddenOnStartPage
+      palette { primary { main dark text link } secondary { main dark text link } }
       searchString {
         header
         palette {
@@ -108,6 +114,7 @@ class BoardConfig:
     title: str
     search_string: dict[str, Any] | None
     widgets: list[dict[str, Any]] = field(default_factory=list)
+    settings: dict[str, Any] = field(default_factory=dict)
 
 
 def parse_infoboard_id(link: str) -> str:
@@ -152,7 +159,7 @@ async def _graphql(
                 "Referer": f"{base}/docs/?frame=left",
             },
         )
-    except (httpx.TimeoutException, httpx.NetworkError) as e:
+    except httpx.RequestError as e:
         logger.warning("GraphQL %s request failed: %r", op, e)
         raise NetworkError(code="GRAPHQL_REQUEST_FAILED", message=f"GraphQL request failed: {e!r}") from e
 
@@ -193,7 +200,9 @@ async def fetch_board(
     one = ((data.get("board") or {}).get("one")) or None
     if not one:
         raise ParseError(code="BOARD_NOT_FOUND", message=f"board id={board_id!r} не найден")
-    widgets = one.get("widgets") or []
+    widgets = one.get("widgets") if isinstance(one, dict) else None
+    if not isinstance(widgets, list) or one.get("id") != board_id or not all(isinstance(w, dict) for w in widgets):
+        raise ParseError(code="CABINET_BOARD_INVALID", message=f"Invalid configuration for {board_id!r}")
     logger.debug(
         "fetch_board -> id=%r title=%r widgets=%s",
         one.get("id"), one.get("title"),
@@ -205,6 +214,10 @@ async def fetch_board(
         title=str(one.get("title") or ""),
         search_string=one.get("searchString"),
         widgets=list(widgets),
+        settings={key: one[key] for key in (
+            "boardUuid", "background", "backgroundFilename", "icons", "background2", "background2Filename",
+            "disableBackgroundBlur", "logo", "logoFilename", "logo2", "logo2Filename", "hiddenOnStartPage", "palette",
+        ) if one.get(key) is not None},
     )
 
 
@@ -234,6 +247,7 @@ async def set_widgets(
     (см. widgets_to_input). Сериализуется в JSON-строку, как ожидает каталог.
     """
     config_input: dict[str, Any] = {
+        **board.settings,
         "id": board.id,
         "author": board.author,
         "title": board.title,
@@ -254,7 +268,7 @@ async def set_widgets(
 
 
 # --- Опросник -> чистка под-кабинетов -------------------------------------------------
-# Аксиома: виджет «Вернуться назад» не трогаем никогда. «Выбрать всё» в ответах => вопрос пропускаем.
+# Системные виджеты сохраняются. «Выбрать всё» возвращает сохранённые варианты.
 BACK_HEADER = "Вернуться назад"
 SELECT_ALL = "Выбрать всё"
 
@@ -268,20 +282,28 @@ def _norm(s: str | None) -> str:
 SYSTEM_KEEP = {_norm(BACK_HEADER), _norm("Справочная информация"), _norm("Спарвочная информация")}
 
 
-def extract_sub_cabinets(parent: BoardConfig) -> dict[str, str]:
+def extract_sub_cabinets(parent: BoardConfig, *, base_url: str | None = None) -> dict[str, str]:
     """Из виджетов родителя -> {sub_board_id: header_блока}. Берём infoboard-id из titleLink/links href; 'Вернуться назад' пропускаем."""
     subs: dict[str, str] = {}
     for w in parent.widgets:
         header = w.get("header") or ""
-        if _norm(header) == _norm(BACK_HEADER):
+        if _norm(header) in SYSTEM_KEEP:
             continue
         hrefs = [((w.get("titleLink") or {}).get("href")) or ""]
-        hrefs += [(l.get("href") or "") for l in (w.get("links") or [])]
+        hrefs += [(link.get("href") or "") for link in (w.get("links") or [])
+                  if _norm(link.get("title")) not in SYSTEM_KEEP]
         for h in hrefs:
             if "infoboard=" in h:
+                url = urlsplit(h)
+                if url.scheme == "kodeks":
+                    if url.netloc != "link" or url.path != "/d":
+                        continue
+                elif (url.scheme and url.scheme not in {"http", "https"}) or (
+                    url.netloc and base_url and url.hostname != urlsplit(base_url).hostname
+                ):
+                    continue
                 try:
                     subs[parse_infoboard_id(h)] = header
-                    break
                 except ParseError:
                     continue
     return subs
@@ -326,25 +348,30 @@ async def crawl_boards(
         try:
             board = await fetch_board(base_url, client, cookies, board_id)
         except ParseError as e:
+            if board_id == root_id or e.code != "BOARD_NOT_FOUND":
+                raise
             logger.warning("crawl: борд %r пропущен (%s)", board_id, getattr(e, "code", e))
             continue
         except NetworkError as e:
             # Preserve the existing release fix for a link to a missing board.
             # A timeout or a temporary catalog outage must still be retried.
-            if e.code == "GRAPHQL_4XX" and "status=404" in e.message:
+            if board_id != root_id and e.code == "GRAPHQL_4XX" and "status=404" in e.message:
                 logger.warning("crawl: отсутствующий борд %r пропущен", board_id)
                 continue
             raise
         boards[board_id] = board
         _index(link_header, board_id)
         _index(board.title, board_id)
-        if depth >= max_depth:
-            continue
-        for child_id, child_header in extract_sub_cabinets(board).items():
+        for child_id, child_header in extract_sub_cabinets(board, base_url=base_url).items():
             if child_id in seen or _norm(child_header) in SYSTEM_KEEP:
                 continue
+            if depth >= max_depth:
+                raise ParseError(code="CABINET_PLAN_INVALID", message="Cabinet navigation exceeds the depth limit")
             seen.add(child_id)
             queue.append((child_id, depth + 1, child_header))
+
+    if queue:
+        raise ParseError(code="CABINET_PLAN_INVALID", message="Cabinet navigation exceeds the board limit")
 
     logger.info(
         "crawl от %r: бордов=%s (глубина<=%s), названий в индексе=%s",
@@ -361,6 +388,7 @@ class QuestionPlan:
     sub_id: str | None = None
     keep_headers: list[str] = field(default_factory=list)
     delete_headers: list[str] = field(default_factory=list)
+    restore_headers: list[str] = field(default_factory=list)
 
 
 # Справочник «вопрос -> виджеты» лежит JSON-файлом рядом с модулем (см. gen через scripts).
@@ -382,12 +410,46 @@ def load_questionnaire_map(path: str | Path | None = None) -> list[dict[str, Any
 
 
 def _find_q(qmap: list[dict[str, Any]], question: str) -> dict[str, Any] | None:
-    """Найти запись справочника по тексту вопроса (нормализованное вхождение в обе стороны)."""
-    qn = _norm(question)
-    for m in qmap:
-        if m["q_norm"] and (m["q_norm"] in qn or qn in m["q_norm"]):
-            return m
-    return None
+    qn = _norm(question).removesuffix("(можно выбрать несколько)").strip()
+    matches = [entry for entry in qmap if qn and entry["q_norm"] == qn]
+    if len(matches) > 1:
+        raise ParseError(code="CABINET_PLAN_INVALID", message="Question matches multiple entries")
+    return matches[0] if matches else None
+
+
+def _widget_selection(current, archive, allowed, selected):
+    """Rebuild the order with hidden widgets, then split it by the new selection."""
+    layout = [(widget, False) for widget in current]
+    current_ids = {widget.get("widgetUuid") for widget in current if widget.get("widgetUuid")}
+    current_headers = {_norm(widget.get("header")) for widget in current}
+    archived_ids = set()
+    for entry in sorted(archive, key=lambda item: item["index"]):
+        widget = entry["widget"]
+        uid = widget.get("widgetUuid")
+        if not uid or uid in archived_ids:
+            raise ParseError(code="CABINET_WIDGET_STATE_INVALID", message="Invalid archived widget identity")
+        archived_ids.add(uid)
+        if uid in current_ids:
+            continue  # A widget restored outside the integration keeps its current configuration.
+        if _norm(widget.get("header")) in selected & current_headers:
+            raise ParseError(code="CABINET_WIDGET_CONFLICT", message="An archived widget has a replacement with the same title")
+        layout.insert(entry["index"], (widget, True))
+
+    visible, hidden, removed, restored = [], [], [], []
+    for index, (widget, archived) in enumerate(layout):
+        header = _norm(widget.get("header"))
+        keep = header in selected if archived else (
+            header not in allowed - selected or header in SYSTEM_KEEP or widget.get("isSpecial")
+        )
+        if keep:
+            visible.append(widget)
+            if archived:
+                restored.append(widget.get("header"))
+        else:
+            hidden.append({"widget": widget, "index": index})
+            if not archived:
+                removed.append(widget.get("header"))
+    return visible, hidden, removed, restored
 
 
 async def correct_cabinet(
@@ -399,97 +461,129 @@ async def correct_cabinet(
     *,
     dry_run: bool = False,
     qmap: list[dict[str, Any]] | None = None,
+    repository: CabinetWidgetStateRepository | None = None,
+    reg: str | None = None,
 ) -> list[QuestionPlan]:
-    """
-    По опроснику почистить под-кабинеты, опираясь на справочник. parent_link — точка входа;
-    целевой под-кабинет ищется ВГЛУБЬ по всему дереву (он может лежать на несколько уровней ниже).
-    Удаляем ТОЛЬКО виджеты известных вариантов ответа, которые клиент НЕ выбрал; всё остальное
-    (навигация, справка, выбранные варианты, неизвестные виджеты) остаётся. 'Выбрать всё' -> вопрос не трогаем.
-    Под-кабинет находим по sub_block из справочника среди всех бордов дерева (по title/заголовку ссылки);
-    при неоднозначности (>1 совпадения) кабинет НЕ трогаем (action='ambiguous').
-    """
+    """Validate the complete questionnaire and apply the new widget selection."""
+    if repository is not None and not reg:
+        raise ValueError("A registration is required for the widget archive")
+    link = urlsplit(parent_link)
+    if link.netloc and (link.scheme not in {"http", "https"} or link.hostname != urlsplit(base_url).hostname):
+        raise ParseError(code="CABINET_LINK_OUT_OF_SCOPE", message="Cabinet link belongs to another catalog")
     qmap = qmap if qmap is not None else load_questionnaire_map()
     parent_id = parse_infoboard_id(parent_link)
     boards, by_name = await crawl_boards(base_url, client, cookies, parent_id)
-    logger.info(
-        "correct_cabinet parent=%r поддерево: %s",
-        parent_id, {bid: b.title for bid, b in boards.items()},
-    )
-
     plans: list[QuestionPlan] = []
-    pending_removals: dict[str, set[str]] = {}
-    for q in questions:
-        question = str(q.get("question") or "")
-        answers = list(q.get("answers") or [])
-        if any(_norm(a) == _norm(SELECT_ALL) for a in answers):
-            plans.append(QuestionPlan(question, "skip-select-all"))
-            logger.info("Q %r -> 'Выбрать всё' -> пропуск", question[:60])
-            continue
+    selections: dict[str, tuple[set[str], set[str], set[str]]] = {}
+    seen_questions: set[str] = set()
+    for item in questions:
+        question = item.get("question")
+        answers = item.get("answers")
+        if (not isinstance(question, str) or not question.strip() or not isinstance(answers, list)
+                or any(not isinstance(answer, str) or not answer.strip() for answer in answers)):
+            raise ParseError(code="CABINET_PLAN_INVALID", message="A question requires a title and an explicit answer list")
         m = _find_q(qmap, question)
+        key = m["q_norm"] if m else _norm(question)
+        if key in seen_questions:
+            raise ParseError(code="CABINET_PLAN_INVALID", message="Duplicate questionnaire question")
+        seen_questions.add(key)
+        chosen = {_norm(answer) for answer in answers}
+        select_all = _norm(SELECT_ALL) in chosen
+        if select_all and len(chosen) != 1:
+            raise ParseError(code="CABINET_PLAN_INVALID", message="Select all cannot be combined with individual answers")
+        if select_all and (m is None or repository is None):
+            plans.append(QuestionPlan(question, "skip-select-all"))
+            continue
         if m is None:
             plans.append(QuestionPlan(question, "unknown-question"))
-            logger.warning("Q %r -> нет в справочнике -> пропуск", question[:60])
             continue
-        matches = by_name.get(_norm(m["sub_block"]), [])
-        if not matches:
-            plans.append(QuestionPlan(question, "no-sub"))
-            logger.warning("Q %r -> под-кабинет %r не найден в дереве -> пропуск", question[:60], m["sub_block"])
-            continue
-        if len(matches) > 1:
-            plans.append(QuestionPlan(question, "ambiguous", None, [], list(matches)))
-            logger.error(
-                "Q %r -> под-кабинет %r найден в %s местах %s -> НЕ трогаем (нужно уточнение)",
-                question[:60], m["sub_block"], len(matches), matches,
-            )
-            continue
-        sub_id = matches[0]
-        sub = boards[sub_id]
-        selected = {_norm(a) for a in answers if _norm(a) != _norm(SELECT_ALL)}
-        unknown = selected - {_norm(answer) for answer in m["answers"]}
-        if unknown:
+        options = {_norm(answer): _norm(header) for answer, header in m["answers"].items()}
+        if not select_all and chosen - options.keys():
             raise ParseError(code="UNKNOWN_QUESTIONNAIRE_ANSWER", message=f"Unknown answer for question {question!r}")
-        # к удалению — заголовки виджетов НЕвыбранных вариантов (из справочника)
-        delete_headers = {
-            _norm(header) for opt, header in m["answers"].items()
-            if header and _norm(opt) not in selected
-        }
-        keep, delete = [], []
-        for w in sub.widgets:
-            h = _norm(w.get("header"))
-            if h in SYSTEM_KEEP:           # навигация/справка — НИКОГДА не трогаем
-                keep.append(w.get("header"))
-            elif h in delete_headers:
-                delete.append(w.get("header"))
-            else:
-                keep.append(w.get("header"))
-        plans.append(QuestionPlan(question, "prune", sub_id, keep, delete))
-        logger.info("Q %r -> sub=%s(%r) delete=%s", question[:60], sub_id, sub.title, delete)
-        if delete:
-            pending_removals.setdefault(sub_id, set()).update(delete_headers)
+        if not select_all and any(not options[answer] for answer in chosen):
+            raise ParseError(code="QUESTIONNAIRE_WIDGET_UNMAPPED", message=f"An answer has no widget mapping for {question!r}")
+        matches = by_name.get(_norm(m["sub_block"]), [])
+        if len(matches) != 1:
+            plans.append(QuestionPlan(question, "ambiguous" if matches else "no-sub"))
+            continue
+        board_id = matches[0]
+        allowed = set(options.values()) - {""}
+        selected = allowed if select_all else {options[answer] for answer in chosen}
+        required = set() if select_all else selected
+        if board_id in selections:
+            previous_allowed, previous_selected, previous_required = selections[board_id]
+            if previous_allowed & allowed:
+                raise ParseError(code="CABINET_PLAN_INVALID", message="Questions overlap on the same widget")
+            allowed, selected = previous_allowed | allowed, previous_selected | selected
+            required = previous_required | required
+        selections[board_id] = allowed, selected, required
+        plans.append(QuestionPlan(question, "prune", board_id))
 
-    invalid = [plan for plan in plans if plan.action in {"unknown-question", "no-sub", "ambiguous"}]
+    invalid = [plan.action for plan in plans if plan.action in {"unknown-question", "no-sub", "ambiguous"}]
     if invalid:
-        raise ParseError(
-            code="CABINET_PLAN_INVALID",
-            message=f"Cannot resolve all questionnaire targets: {[plan.action for plan in invalid]}",
-        )
+        raise ParseError(code="CABINET_PLAN_INVALID", message=f"Cannot resolve all questionnaire targets: {invalid}")
 
-    # Validate every question before making the first full configuration write.
-    if not dry_run:
-        for sub_id, delete_headers in pending_removals.items():
-            sub = boards[sub_id]
-            kept_widgets = [
-                w for w in sub.widgets
-                if _norm(w.get("header")) in SYSTEM_KEEP or _norm(w.get("header")) not in delete_headers
-            ]
-            expected = widgets_to_input(kept_widgets)
-            await set_widgets(base_url, client, cookies, sub, expected)
+    changes = []
+    for board_id, (allowed, selected, required) in selections.items():
+        board = boards[board_id]
+        current = widgets_to_input(board.widgets)
+        state = await repository.get(base_url, reg, board_id) if repository else CabinetWidgetState([])
+        archive = state.archive
+        if state.pending is not None:
+            if current != state.pending["after"]:
+                raise ParseError(code="WIDGET_WRITE_UNCERTAIN", message=f"Previous widget write is still unconfirmed for {board_id!r}")
+            archive = state.pending["archive"]
+        expected, hidden, removed, restored = _widget_selection(current, archive, allowed, selected)
+        if required - {_norm(widget.get("header")) for widget in expected}:
+            raise ParseError(code="CABINET_WIDGET_NOT_FOUND", message=f"A selected widget is absent from the cabinet and archive for {board_id!r}")
+        if expected != current and repository:
+            ids = [entry["widget"].get("widgetUuid") for entry in hidden]
+            if not all(ids) or len(set(ids)) != len(ids) or any(not widget for widget in current):
+                raise ParseError(code="CABINET_BOARD_INVALID", message=f"Cannot safely archive widgets in {board_id!r}")
+        for plan in plans:
+            if plan.sub_id == board_id:
+                plan.keep_headers = [widget.get("header") for widget in expected]
+                plan.delete_headers = removed
+                plan.restore_headers = restored
+        changes.append((board, current, expected, state, archive, hidden))
+
+    if dry_run:
+        return plans
+    for board, current, expected, state, archive, hidden in changes:
+        if current == expected:
+            if repository and (state.pending is not None or state.archive != hidden):
+                await repository.put(base_url, reg, board.id, CabinetWidgetState(hidden))
+            continue
+        if repository:
+            transition = {"before": current, "after": expected, "archive": hidden}
+            await repository.put(base_url, reg, board.id, CabinetWidgetState(archive, transition))
+        uncertain = None
+        try:
+            await set_widgets(base_url, client, cookies, board, expected)
+        except ParseError as error:
+            if error.code != "WIDGET_WRITE_UNCERTAIN":
+                raise
+            uncertain = error
+        try:
+            actual = await fetch_board(base_url, client, cookies, board.id)
+        except (NetworkError, ParseError) as error:
+            raise ParseError(code="WIDGET_WRITE_UNCERTAIN", message=f"Widget write could not be verified for {board.id!r}") from error
+        actual_inputs = widgets_to_input(actual.widgets)
+        if (actual.title, actual.author, actual.search_string, actual.settings) != (
+            board.title, board.author, board.search_string, board.settings
+        ):
+            raise ParseError(code="WIDGET_WRITE_UNCERTAIN", message=f"Cabinet settings changed during the widget write for {board.id!r}")
+        if actual_inputs != expected:
+            if uncertain or actual_inputs != current:
+                raise ParseError(code="WIDGET_WRITE_UNCERTAIN", message=f"Widget write is unconfirmed for {board.id!r}") from uncertain
+            if repository:
+                await repository.put(base_url, reg, board.id, CabinetWidgetState(archive))
+            raise ParseError(code="CABINET_WRITE_NOT_CONFIRMED", message=f"Widget configuration was not applied for {board.id!r}")
+        if repository:
             try:
-                actual = await fetch_board(base_url, client, cookies, sub_id)
-            except (NetworkError, ParseError) as error:
-                raise ParseError(code="WIDGET_WRITE_UNCERTAIN", message=f"Widget write could not be verified for {sub_id!r}") from error
-            if widgets_to_input(actual.widgets) != expected:
-                raise ParseError(code="CABINET_WRITE_NOT_CONFIRMED", message=f"Widget configuration was not applied for {sub_id!r}")
+                await repository.put(base_url, reg, board.id, CabinetWidgetState(hidden))
+            except NetworkError as error:
+                raise ParseError(code="WIDGET_WRITE_UNCERTAIN", message=f"Saved widgets were verified but the archive could not be finalized for {board.id!r}") from error
     return plans
 
 

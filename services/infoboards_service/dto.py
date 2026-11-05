@@ -24,20 +24,27 @@ from pydantic import BaseModel, Field, field_validator
 
 class CorrectCabinetQuestion(BaseModel):
     """Вопрос опросника с выбранными клиентом ответами."""
-    question: str = ""
-    answers: list[str] = Field(default_factory=list)
+    question: str
+    answers: list[str]
+
+    @field_validator("question")
+    @classmethod
+    def validate_question(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("Question cannot be blank")
+        return value
 
 
 class CorrectCabinetDTO(BaseModel):
     """
     DTO топика correct_cabinet: уточнение кабинета по опроснику.
     userId — пользователь, которому правим (эхо в ответ); reg — рег; link — ссылка на родительский кабинет;
-    questions — вопросы с выбранными ответами. 'Выбрать всё' в ответах => вопрос не трогаем.
+    questions — вопросы с выбранными ответами, включая вариант «Выбрать всё».
     """
     userId: int | None = None
     reg: str
     link: str
-    questions: list[CorrectCabinetQuestion] = Field(default_factory=list)
+    questions: list[CorrectCabinetQuestion]
 
     @field_validator("reg", mode="before")
     @classmethod

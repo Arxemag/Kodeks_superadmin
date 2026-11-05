@@ -24,6 +24,7 @@ from aiokafka.structs import ConsumerRecord, OffsetAndMetadata
 from pydantic import ValidationError
 
 from common.config import get_settings
+from common.cabinet_widget_state import CabinetWidgetStateRepository
 from common.catalog_lock import catalog_operation
 from common.exceptions import AuthError, NetworkError, ParseError
 from common.http import _default_headers
@@ -101,6 +102,7 @@ async def _handle_with_retries(
                     base_url, http_client, cookies, dto.link,
                     [q.model_dump() for q in dto.questions],
                     dry_run=dry_run,
+                    repository=CabinetWidgetStateRepository(), reg=dto.reg,
                 )
             if dry_run:
                 logger.warning("CORRECT_CABINET_DRY_RUN=true — виджеты НЕ удалялись (только план)")
