@@ -130,16 +130,16 @@ def _resolve(value, variables: dict, declarations: dict):
     return variables[name] if name in variables else declarations[name]
 
 
-def _target(value, variables: dict, declarations: dict, *, optional_uuid: bool = False) -> str | None:
+def _target(value, variables: dict, declarations: dict, *, uuid: bool = False, nullable: bool = False) -> str | None:
     value = _resolve(value, variables, declarations)
     if isinstance(value, StringValueNode):
         value = value.value
-    if optional_uuid and (value is None or isinstance(value, NullValueNode)):
+    if nullable and (value is None or isinstance(value, NullValueNode)):
         return None
-    pattern = _BOARD_UUID if optional_uuid else _BOARD_ID
+    pattern = _BOARD_UUID if uuid else _BOARD_ID
     if not isinstance(value, str) or not pattern.fullmatch(value):
-        raise _invalid("Invalid cabinet UUID" if optional_uuid else "Invalid cabinet ID")
-    return value.lower() if optional_uuid else value
+        raise _invalid("Invalid cabinet UUID" if uuid else "Invalid cabinet ID")
+    return value.lower() if uuid else value
 
 
 def _classify(method: str, operation: OperationDefinitionNode, variables: dict) -> tuple[str, str | None, str | None]:
@@ -162,9 +162,13 @@ def _classify(method: str, operation: OperationDefinitionNode, variables: dict) 
             value = {item.name.value: item.value for item in value.fields}
         if not isinstance(value, dict):
             raise _invalid("editConfig input must be an object")
-        return action, _target(value.get("id"), variables, declarations), _target(
-            value.get("boardUuid"), variables, declarations, optional_uuid=True,
-        )
+        board_id = _target(value.get("id"), variables, declarations, nullable=True)
+        if board_id is None:
+            # Native editConfig creates a cabinet when there is no ID. The
+            # gateway authorizes that action for administrators only.
+            return "createConfig", None, None
+        board_uuid = _target(value.get("boardUuid"), variables, declarations, uuid=True, nullable=True)
+        return action, board_id, board_uuid
     if action == "deleteConfig":
         if arguments.keys() != {"id"}:
             raise _invalid("deleteConfig requires one id argument")

@@ -11,6 +11,12 @@ UUID = "019E1234-CB81-7350-B0D7-48E650CF7D72"
 EDIT = "mutation EditConfigWidgets($ConfigInput: ConfigInput) { editConfig(input: $ConfigInput) { id title } }"
 
 
+@pytest.mark.parametrize("target", [{}, {"id": None}])
+def test_native_edit_config_without_target_requires_create_authorization(target):
+    result = _post(EDIT, variables={"ConfigInput": {"title": "Новый кабинет", **target}})
+    assert (result.action, result.board_id, result.board_uuid) == ("createConfig", None, None)
+
+
 def _post(query, **payload):
     body = json.dumps({"query": query, **payload}).encode()
     return requests.parse_graphql_request("POST", body, "context=docs")

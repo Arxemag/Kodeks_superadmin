@@ -71,7 +71,8 @@ async def test_editor_authorized_only_after_current_portal_scope_binding_and_mem
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('change', ['password', 'uid', 'missing_user', 'wrong_board', 'wrong_uuid',
-                                     'no_membership', 'no_binding', 'unconfirmed_board', 'untracked_user', 'changed_group', 'delete'])
+                                     'no_membership', 'no_binding', 'unconfirmed_board', 'untracked_user', 'changed_group',
+                                     'delete', 'create'])
 async def test_editor_denied_on_missing_identity_or_authority(environment, change):
     h = environment
     args = {}
@@ -86,6 +87,7 @@ async def test_editor_denied_on_missing_identity_or_authority(environment, chang
     if change == 'untracked_user': h.bindings['B'] = EditorGroup('B', 'ROOT', 77, ('B', 'CHILD'), ())
     if change == 'changed_group': h.groups[_group_title('123', 'B')] = 78
     if change == 'delete': args['action'] = 'deleteConfig'
+    if change == 'create': args['action'] = 'createConfig'
     with pytest.raises(AuthError) as caught:
         await authorize(h, **args)
     assert caught.value.code == 'EDITOR_WRITE_FORBIDDEN'
