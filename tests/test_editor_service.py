@@ -98,6 +98,18 @@ async def test_create_group_then_confirm_acl_before_membership_and_repeat(harnes
 
 
 @pytest.mark.asyncio
+async def test_new_widget_link_does_not_extend_previously_granted_edit_scope(harness):
+    h = harness
+    await h.service.sync(REG, snapshot('alice'))
+    h.scopes.return_value = {ROOT: EditorScope(BRANCH, frozenset({BRANCH, PAGE, 'P099'}))}
+
+    await h.service.sync(REG, snapshot('alice'))
+
+    assert h.acl.await_args.kwargs['exclusive_edit'] == {BRANCH: {1, 2, 77}, PAGE: {1, 2, 77}}
+    assert set(h.bindings[BRANCH].boards) == {BRANCH, PAGE}
+
+
+@pytest.mark.asyncio
 async def test_revocation_removes_member_before_acl_and_leaves_admin_whitelist(harness):
     h = harness
     await h.service.sync(REG, snapshot('alice'))

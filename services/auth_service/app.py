@@ -29,6 +29,7 @@ from services.auth_service.sso_store import MemoryTicketStore
 from services.auth_service.metrics import active_requests, auth_errors_total
 from services.auth_service.schemas import ErrorResponse, LoginRequest, OkResponse
 from services.auth_service.service import AuthService
+from services.auth_service.editor_graphql import router as editor_graphql_router, is_internal_auth_request
 from services.infoboards_service.schemas import (
     ErrorResponse as InfoboardsErrorResponse,
     InfoboardLinkResponse,
@@ -59,12 +60,17 @@ def create_app() -> FastAPI:
     app = FastAPI(title="Auth Service", lifespan=lifespan)
     app.state.sso_store = MemoryTicketStore()
     app.include_router(sso_router)
+    app.include_router(editor_graphql_router)
 
     @app.middleware("http")
     async def trace_and_metrics_mw(request: Request, call_next):
         """Для каждого запроса: увеличиваем счётчик активных запросов, выставляем trace_id, замеряем время, прокидываем trace_id в ответ."""
         active_requests.inc()
         try:
+            path = request.url.path
+            if (path.startswith(("/api/expert/reg/", "/api/expert/reg-services")) or path == "/admin/reg-services"):
+                if not is_internal_auth_request(request, get_settings()):
+                    return JSONResponse({"code": "INTERNAL_ACCESS_REQUIRED"}, status_code=403)
             incoming = request.headers.get("X-Trace-Id")
             set_trace_id(incoming or str(uuid.uuid4()))
             start = time.perf_counter()

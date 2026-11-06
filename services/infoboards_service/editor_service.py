@@ -185,8 +185,11 @@ class EditorService:
                 if gid is None:
                     continue
                 if wanted.get(branch) == binding.root_id:
-                    boards = tuple(sorted(scopes[binding.root_id].editable_ids))
-                    for board in boards:
+                    reachable = scopes[binding.root_id].editable_ids
+                    # Editors can change links in their own widgets. Only the
+                    # original approved scope can inherit editing rights.
+                    boards = binding.boards or tuple(sorted(reachable))
+                    for board in set(boards) & reachable:
                         edit.setdefault(board, []).append(gid)
                         view.setdefault(board, []).append(gid)
                         exclusive.setdefault(board, set(admin_ids)).add(gid)

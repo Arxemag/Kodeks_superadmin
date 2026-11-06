@@ -8,6 +8,8 @@
 from __future__ import annotations
 
 import re
+from ipaddress import ip_network
+from urllib.parse import urlsplit
 from functools import lru_cache
 
 from pydantic import Field, SecretStr, model_validator
@@ -55,6 +57,9 @@ class Settings(BaseSettings):
     EDITOR_PORTAL_DB_URL: SecretStr = SecretStr("")
     EDITOR_SYNC_REGS: str = ""
     EDITOR_SYNC_SECONDS: float = Field(30, ge=5, le=3600)
+    EDITOR_GRAPHQL_REG: str = ""
+    EDITOR_GRAPHQL_UPSTREAM: str = ""
+    AUTH_INTERNAL_NETWORKS: str = ""
     LOG_LEVEL: str = Field("INFO", description="Log level")
     CHROMIUM_WS_ENDPOINT: str = Field(
         "",
@@ -200,6 +205,20 @@ class Settings(BaseSettings):
             raise ValueError("EDITOR_SYNC_REGS must contain comma-separated registration numbers")
         if editor_regs and not self.EDITOR_PORTAL_DB_URL.get_secret_value():
             raise ValueError("EDITOR_PORTAL_DB_URL is required when EDITOR_SYNC_REGS is configured")
+        if {reg.strip() for reg in editor_regs} - {self.EDITOR_GRAPHQL_REG}:
+            raise ValueError("EDITOR_SYNC_REGS requires the GraphQL gateway for the same registration number")
+        if self.EDITOR_GRAPHQL_REG or self.EDITOR_GRAPHQL_UPSTREAM:
+            upstream = urlsplit(self.EDITOR_GRAPHQL_UPSTREAM)
+            if (not re.fullmatch(r"[0-9]+", self.EDITOR_GRAPHQL_REG)
+                    or upstream.scheme not in {"http", "https"} or not upstream.hostname
+                    or upstream.username or upstream.password or upstream.path not in {"", "/"}
+                    or upstream.query or upstream.fragment):
+                raise ValueError("EDITOR_GRAPHQL_REG and an upstream HTTP origin are required together")
+            if not self.AUTH_INTERNAL_NETWORKS:
+                raise ValueError("AUTH_INTERNAL_NETWORKS is required for the editor GraphQL gateway")
+        if self.AUTH_INTERNAL_NETWORKS:
+            for network in self.AUTH_INTERNAL_NETWORKS.split(","):
+                ip_network(network.strip())
         if not self.KAFKA_BOOTSTRAP_SERVERS:
             self.KAFKA_BOOTSTRAP_SERVERS = self.KAFKA_BROKER or "127.0.0.1:9092"
 
