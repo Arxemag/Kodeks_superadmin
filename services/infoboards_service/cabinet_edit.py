@@ -278,7 +278,7 @@ async def set_widgets(
 
 
 # --- Опросник -> чистка под-кабинетов -------------------------------------------------
-# Системные виджеты сохраняются. «Выбрать всё» возвращает сохранённые варианты.
+# Системные виджеты сохраняются. «Выбрать всё» пропускает вопрос.
 BACK_HEADER = "Вернуться назад"
 SELECT_ALL = "Выбрать всё"
 
@@ -528,19 +528,18 @@ async def correct_cabinet(
         if (not isinstance(question, str) or not question.strip() or not isinstance(answers, list)
                 or any(not isinstance(answer, str) or not answer.strip() for answer in answers)):
             raise ParseError(code="CABINET_PLAN_INVALID", message="A question requires a title and an explicit answer list")
-        legacy = legacy_question(boards[parent_id].title, question) if use_legacy_profiles else None
-        explicit = item.get("options") is not None
-        if not explicit and any(item.get(key) is not None for key in ("blocks", "linkWidget")):
-            raise ParseError(code="CABINET_PLAN_INVALID", message="Block selectors require the complete option list")
-        m = _find_q(qmap, question) if not (legacy or explicit) else None
-        key = m["q_norm"] if m else question_key(question)
+        key = question_key(question)
         if key in seen_questions:
             raise ParseError(code="CABINET_PLAN_INVALID", message="Duplicate questionnaire question")
         seen_questions.add(key)
         chosen = {_norm(answer) for answer in answers}
-        select_all = _norm(SELECT_ALL) in chosen
-        if select_all and len(chosen) != 1:
-            raise ParseError(code="CABINET_PLAN_INVALID", message="Select all cannot be combined with individual answers")
+        if _norm(SELECT_ALL) in chosen:
+            plans.append(QuestionPlan(question, "skip-select-all"))
+            continue
+        legacy = legacy_question(boards[parent_id].title, question) if use_legacy_profiles else None
+        explicit = item.get("options") is not None
+        if not explicit and any(item.get(key) is not None for key in ("blocks", "linkWidget")):
+            raise ParseError(code="CABINET_PLAN_INVALID", message="Block selectors require the complete option list")
         if legacy or explicit:
             if not archives:
                 for bid, board in boards.items():
@@ -564,16 +563,14 @@ async def correct_cabinet(
                                             required | selection.selected)
                 plans.append(QuestionPlan(question, "prune", board_id))
             continue
-        if select_all and (m is None or repository is None):
-            plans.append(QuestionPlan(question, "skip-select-all"))
-            continue
+        m = _find_q(qmap, question)
         if m is None:
             plans.append(QuestionPlan(question, "unknown-question"))
             continue
         options = {_norm(answer): _norm(header) for answer, header in m["answers"].items()}
-        if not select_all and chosen - options.keys():
+        if chosen - options.keys():
             raise ParseError(code="UNKNOWN_QUESTIONNAIRE_ANSWER", message=f"Unknown answer for question {question!r}")
-        if not select_all and any(not options[answer] for answer in chosen):
+        if any(not options[answer] for answer in chosen):
             raise ParseError(code="QUESTIONNAIRE_WIDGET_UNMAPPED", message=f"An answer has no widget mapping for {question!r}")
         matches = by_name.get(_norm(m["sub_block"]), [])
         if len(matches) != 1:
@@ -581,8 +578,8 @@ async def correct_cabinet(
             continue
         board_id = matches[0]
         allowed = set(options.values()) - {""}
-        selected = allowed if select_all else {options[answer] for answer in chosen}
-        required = set() if select_all else selected
+        selected = {options[answer] for answer in chosen}
+        required = selected
         if board_id in selections:
             previous_allowed, previous_selected, previous_required = selections[board_id]
             if previous_allowed & allowed:

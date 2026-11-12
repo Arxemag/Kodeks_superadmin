@@ -305,7 +305,7 @@ async def test_explicit_options_resolve_by_headers_and_restore_without_question_
     await _correct_with_state(catalog, repo, [{**question, "answers": ["Виджет А"]}])
     assert catalog.live_inputs() == [a, manual, back]
 
-    await _correct_with_state(catalog, repo, [{**question, "answers": ["Выбрать всё"]}])
+    await _correct_with_state(catalog, repo, [{**question, "answers": question["options"]}])
     assert catalog.live_inputs() == original
 
 
@@ -329,7 +329,7 @@ async def test_links_widget_keeps_identity_and_archives_links_through_reselectio
     assert current[0]["links"] == original[0]["links"][:2]
     assert current[1:] == original[1:]
 
-    await _correct_with_state(catalog, repo, [{**question, "answers": ["Выбрать всё"]}])
+    await _correct_with_state(catalog, repo, [{**question, "answers": question["options"]}])
     assert catalog.live_inputs() == original
 
 
@@ -365,7 +365,7 @@ async def test_reselection_restores_original_config_uuid_and_order_without_losin
     assert catalog.live_inputs() == [a, manual, back, c]
     assert len(catalog.posts) == 3
 
-    await _correct_with_state(catalog, repo, _answers(cabinet_edit.SELECT_ALL))
+    await _correct_with_state(catalog, repo, _answers('Оставить А', 'Удалить Б', 'Удалить В'))
     assert catalog.live_inputs() == original
     assert len(catalog.posts) == 4
     state = await repo.get(_STATE_BASE, _STATE_REG, _STATE_BOARD)
@@ -386,6 +386,27 @@ async def test_repeating_questionnaire_state_does_not_submit_another_mutation(mo
     assert len(catalog.posts) == 1
     assert catalog.live_inputs() == before
     assert await repo.get(_STATE_BASE, _STATE_REG, _STATE_BOARD) == state_before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('other_answers', [[], ['Виджет Б']])
+async def test_select_all_leaves_existing_widgets_and_archive_untouched(monkeypatch, other_answers):
+    catalog = _WidgetCatalog(monkeypatch)
+    repo = _WidgetStateRepository()
+    await _correct_with_state(catalog, repo, _answers('Оставить А'))
+    before = catalog.live_inputs()
+    archive = await repo.get(_STATE_BASE, _STATE_REG, _STATE_BOARD)
+    assert archive.archive
+
+    plans = await _correct_with_state(catalog, repo, [{
+        'question': 'Подпись вопроса', 'options': ['Виджет А', 'Виджет Б', 'Виджет В'],
+        'answers': [cabinet_edit.SELECT_ALL, *other_answers],
+    }])
+
+    assert [plan.action for plan in plans] == ['skip-select-all']
+    assert catalog.live_inputs() == before
+    assert await repo.get(_STATE_BASE, _STATE_REG, _STATE_BOARD) == archive
+    assert len(catalog.posts) == 1
 
 
 @pytest.mark.asyncio
@@ -460,7 +481,7 @@ async def test_pending_write_matching_after_recovers_archive_without_repeating_p
     assert catalog.posts == []
     assert catalog.live_inputs() == pending['after']
     assert await repo.get(_STATE_BASE, _STATE_REG, _STATE_BOARD) == CabinetWidgetState(archive=archive, pending=None)
-    await _correct_with_state(catalog, repo, _answers(cabinet_edit.SELECT_ALL))
+    await _correct_with_state(catalog, repo, _answers('Оставить А', 'Удалить Б', 'Удалить В'))
     assert catalog.posts == [original]
     assert catalog.live_inputs() == original
 

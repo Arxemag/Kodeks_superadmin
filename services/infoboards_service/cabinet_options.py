@@ -63,10 +63,8 @@ def resolve_options(item, legacy, boards, archives, protected):
         raise _invalid("Question does not identify cabinet options")
     options = _labels(config["options"]) - {SELECT_ALL}
     chosen = _labels(item["answers"])
-    if not options or (chosen != {SELECT_ALL} and not chosen <= options):
+    if not options or not chosen <= options:
         raise _invalid("The selected answers do not match the available cabinet options")
-    if chosen == {SELECT_ALL}:
-        chosen = options
     aliases = {normalize_title(source): normalize_title(target)
                for source, target in config.get("aliases", {}).items()}
     allowed = frozenset(aliases.get(label, label) for label in options)
