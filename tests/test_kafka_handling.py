@@ -326,7 +326,10 @@ async def test_standalone_dlq_failure_never_commits_or_swallows(worker_name):
 
 
 @pytest.mark.asyncio
-async def test_correct_cabinet_dry_run_has_no_success_event_and_uses_catalog_lock():
+@pytest.mark.parametrize("dry_run", [True, False])
+async def test_correct_cabinet_publishes_portal_event_only_after_apply(dry_run):
+    import json
+    from uuid import UUID
     from contextlib import asynccontextmanager
     from services.infoboards_service.correct_cabinet_worker import _handle_with_retries as correct_handle
     held = False
@@ -346,11 +349,11 @@ async def test_correct_cabinet_dry_run_has_no_success_event_and_uses_catalog_loc
     resolver.with_session = session
     settings = SimpleNamespace(KAFKA_CORRECT_CABINET_DLQ_TOPIC='correct-dlq',
                                KAFKA_CABINET_CORRECTED_TOPIC='done', USERS_RETRY_ATTEMPTS=1,
-                               CORRECT_CABINET_DRY_RUN=True)
-    record = _fake_record('correct-cabinet', {'reg': '123', 'link': '?infoboard=one', 'questions': []})
+                               CORRECT_CABINET_DRY_RUN=dry_run)
+    record = _fake_record('correct-cabinet', {'userId': 41, 'reg': '123', 'link': '?infoboard=one', 'questions': []})
     async def plan(*args, **kwargs):
         assert held
-        assert kwargs['dry_run'] is True
+        assert kwargs['dry_run'] is dry_run
         return []
     producer = AsyncMock()
     with patch('services.infoboards_service.correct_cabinet_worker.catalog_operation', operation), \
@@ -359,7 +362,16 @@ async def test_correct_cabinet_dry_run_has_no_success_event_and_uses_catalog_loc
         auth.return_value.login = AsyncMock(return_value={})
         await correct_handle(record, resolver, MagicMock(), producer, settings)
     assert not held
-    producer.send_and_wait.assert_not_awaited()
+    if dry_run:
+        producer.send_and_wait.assert_not_awaited()
+    else:
+        producer.send_and_wait.assert_awaited_once()
+        topic, event = producer.send_and_wait.await_args.args
+        assert topic == event['event_type'] == 'done'
+        assert UUID(event['event_id']).version == 5
+        assert json.loads(event['payload']) == {
+            'userId': 41, 'reg': '123', 'oldLink': '?infoboard=one', 'link': '?infoboard=one',
+        }
 
 
 @pytest.mark.asyncio

@@ -296,6 +296,54 @@ async def _correct_with_state(catalog, repo, questions):
 
 
 @pytest.mark.asyncio
+async def test_explicit_options_resolve_by_headers_and_restore_without_question_mapping(monkeypatch):
+    catalog = _WidgetCatalog(monkeypatch)
+    repo = _WidgetStateRepository()
+    a, manual, b, back, c = original = catalog.live_inputs()
+    question = {"question": "Произвольная подпись в портале", "options": ["Виджет А", "Виджет Б", "Виджет В"]}
+
+    await _correct_with_state(catalog, repo, [{**question, "answers": ["Виджет А"]}])
+    assert catalog.live_inputs() == [a, manual, back]
+
+    await _correct_with_state(catalog, repo, [{**question, "answers": ["Выбрать всё"]}])
+    assert catalog.live_inputs() == original
+
+
+@pytest.mark.asyncio
+async def test_links_widget_keeps_identity_and_archives_links_through_reselection(monkeypatch):
+    catalog = _WidgetCatalog(monkeypatch)
+    repo = _WidgetStateRepository()
+    widget = catalog.original[0]
+    widget["links"] = [
+        {"title": "Рыба", "href": "https://host/fish"},
+        {"title": "Ручная ссылка", "href": "https://host/manual"},
+        {"title": "Молоко", "href": "https://host/milk"},
+    ]
+    catalog.set_live_inputs(cabinet_edit.widgets_to_input(catalog.original))
+    original = catalog.live_inputs()
+    question = {"question": "Виды продукции", "options": ["Рыба", "Молоко"], "linkWidget": widget["header"]}
+
+    await _correct_with_state(catalog, repo, [{**question, "answers": ["Рыба"]}])
+    current = catalog.live_inputs()
+    assert current[0]["widgetUuid"] == original[0]["widgetUuid"]
+    assert current[0]["links"] == original[0]["links"][:2]
+    assert current[1:] == original[1:]
+
+    await _correct_with_state(catalog, repo, [{**question, "answers": ["Выбрать всё"]}])
+    assert catalog.live_inputs() == original
+
+
+def test_native_link_input_omits_nullable_response_fields_and_keeps_explicit_values():
+    assert cabinet_edit.widget_to_input({
+        "__typename": "LinksWidget", "header": "Ссылки", "titleLink": {"href": "", "about": None},
+        "links": [{"title": "Вариант", "href": "/docs", "about": None, "notForChange": False}],
+    }) == {
+        "header": "Ссылки", "titleLink": {"href": ""},
+        "links": [{"title": "Вариант", "href": "/docs", "notForChange": False}],
+    }
+
+
+@pytest.mark.asyncio
 async def test_reselection_restores_original_config_uuid_and_order_without_losing_manual_widget(monkeypatch):
     catalog = _WidgetCatalog(monkeypatch)
     repo = _WidgetStateRepository()

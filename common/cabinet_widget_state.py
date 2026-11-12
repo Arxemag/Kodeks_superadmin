@@ -64,6 +64,17 @@ def _archive(value) -> None:
     if not isinstance(value, list):
         raise _invalid()
     for entry in value:
+        if isinstance(entry, dict) and set(entry) == {"widgetUuid", "links"}:
+            if (not isinstance(entry["widgetUuid"], str) or not entry["widgetUuid"]
+                    or not isinstance(entry["links"], list)):
+                raise _invalid()
+            for link in entry["links"]:
+                if (not isinstance(link, dict) or set(link) != {"link", "index"}
+                        or not isinstance(link["link"], dict)
+                        or type(link["index"]) is not int or link["index"] < 0):
+                    raise _invalid()
+                _json_value(link["link"])
+            continue
         if (not isinstance(entry, dict) or set(entry) != {"widget", "index"}
                 or not isinstance(entry["widget"], dict)
                 or type(entry["index"]) is not int or entry["index"] < 0):

@@ -12,11 +12,13 @@ cabinet-corrected (userId, reg, oldLink, link).
 from __future__ import annotations
 
 import asyncio
+import json
 import random
 import signal
 from datetime import datetime, timezone
 from functools import partial
 from typing import Any
+from uuid import NAMESPACE_URL, uuid5
 
 import httpx
 from aiokafka import AIOKafkaProducer
@@ -138,7 +140,14 @@ async def _handle_with_retries(
 
     # Publishing is outside the catalog retry block: a Kafka delivery failure
     # must not repeat the destructive catalog operation within this attempt.
-    await producer.send_and_wait(settings.KAFKA_CABINET_CORRECTED_TOPIC, result)
+    topic = settings.KAFKA_CABINET_CORRECTED_TOPIC
+    request_id = record.value.get("event_id") if isinstance(record.value, dict) else None
+    source = request_id or f"{record.topic}:{record.partition}:{record.offset}"
+    await producer.send_and_wait(topic, {
+        "event_id": str(uuid5(NAMESPACE_URL, f"kodeks:cabinet-corrected:{source}")),
+        "event_type": topic,
+        "payload": json.dumps(result, ensure_ascii=False),
+    })
 
 
 async def _process_record(record, partition, *, resolver, http_client, producer, consumer, settings):

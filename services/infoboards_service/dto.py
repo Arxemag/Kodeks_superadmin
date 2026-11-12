@@ -26,6 +26,9 @@ class CorrectCabinetQuestion(BaseModel):
     """Вопрос опросника с выбранными клиентом ответами."""
     question: str
     answers: list[str]
+    options: list[str] | None = None
+    blocks: list[str] | None = None
+    linkWidget: str | None = None
 
     @field_validator("question")
     @classmethod

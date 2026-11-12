@@ -31,6 +31,8 @@ import httpx
 from common.exceptions import NetworkError, ParseError
 from common.cabinet_widget_state import CabinetWidgetState, CabinetWidgetStateRepository
 from common.logger import get_logger
+from services.infoboards_service.cabinet_link_options import select_widget_links
+from services.infoboards_service.cabinet_options import legacy_question, question_key, resolve_options
 
 
 logger = get_logger("infoboards.cabinet_edit")
@@ -223,11 +225,17 @@ async def fetch_board(
 
 def widget_to_input(widget: dict[str, Any]) -> dict[str, Any]:
     """Преобразовать виджет из board.one в объект для ConfigInput.widgets (срез вычисляемых полей и None)."""
-    return {
+    result = {
         k: v
         for k, v in widget.items()
         if k not in _COMPUTED_WIDGET_FIELDS and v is not None
     }
+    if "links" in result:
+        result["links"] = [{key: value for key, value in link.items() if value is not None}
+                           for link in result["links"]]
+    if "titleLink" in result:
+        result["titleLink"] = {key: value for key, value in result["titleLink"].items() if value is not None}
+    return result
 
 
 def widgets_to_input(widgets: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -424,7 +432,7 @@ def _widget_selection(current, archive, allowed, selected):
     current_headers = {_norm(widget.get("header")) for widget in current}
     archived_ids = set()
     for entry in sorted(archive, key=lambda item: item["index"]):
-        widget = entry["widget"]
+        widget = widget_to_input(entry["widget"])
         uid = widget.get("widgetUuid")
         if not uid or uid in archived_ids:
             raise ParseError(code="CABINET_WIDGET_STATE_INVALID", message="Invalid archived widget identity")
@@ -452,6 +460,38 @@ def _widget_selection(current, archive, allowed, selected):
     return visible, hidden, removed, restored
 
 
+def _confirmed_archive(state, current, board_id):
+    if state.pending is None:
+        return state.archive
+    if current != widgets_to_input(state.pending["after"]):
+        raise ParseError(code="WIDGET_WRITE_UNCERTAIN", message=f"Previous widget write is still unconfirmed for {board_id!r}")
+    return state.pending["archive"]
+
+
+def _select_links(widgets, archive, selections):
+    replacements = {}
+    removed, restored = [], []
+    for selector, allowed, selected in selections:
+        matches = [widget for widget in widgets if _norm(widget.get("header")) == selector]
+        if len(matches) != 1 or not matches[0].get("widgetUuid"):
+            raise ParseError(code="CABINET_PLAN_INVALID", message=f"Cannot identify links widget {selector!r}")
+        widget = matches[0]
+        uid = widget["widgetUuid"]
+        stored = [entry["links"] for entry in archive if entry["widgetUuid"] == uid]
+        if len(stored) > 1:
+            raise ParseError(code="CABINET_WIDGET_STATE_INVALID", message="Duplicate archived links widget")
+        updated, hidden = select_widget_links(widget, stored[0] if stored else [], allowed, selected)
+        before = {link["title"] for link in widget["links"]}
+        after = {link["title"] for link in updated["links"]}
+        removed.extend(sorted(before - after))
+        restored.extend(sorted(after - before))
+        replacements[uid] = {"widgetUuid": uid, "links": hidden}
+        widgets = [updated if entry is widget else entry for entry in widgets]
+    archive = [entry for entry in archive if entry["widgetUuid"] not in replacements]
+    archive.extend(entry for entry in replacements.values() if entry["links"])
+    return widgets, archive, removed, restored
+
+
 async def correct_cabinet(
     base_url: str,
     client: httpx.AsyncClient,
@@ -470,11 +510,15 @@ async def correct_cabinet(
     link = urlsplit(parent_link)
     if link.netloc and (link.scheme not in {"http", "https"} or link.hostname != urlsplit(base_url).hostname):
         raise ParseError(code="CABINET_LINK_OUT_OF_SCOPE", message="Cabinet link belongs to another catalog")
+    use_legacy_profiles = qmap is None
     qmap = qmap if qmap is not None else load_questionnaire_map()
     parent_id = parse_infoboard_id(parent_link)
     boards, by_name = await crawl_boards(base_url, client, cookies, parent_id)
     plans: list[QuestionPlan] = []
     selections: dict[str, tuple[set[str], set[str], set[str]]] = {}
+    link_selections = {}
+    states = {}
+    archives = {}
     seen_questions: set[str] = set()
     for item in questions:
         question = item.get("question")
@@ -482,8 +526,12 @@ async def correct_cabinet(
         if (not isinstance(question, str) or not question.strip() or not isinstance(answers, list)
                 or any(not isinstance(answer, str) or not answer.strip() for answer in answers)):
             raise ParseError(code="CABINET_PLAN_INVALID", message="A question requires a title and an explicit answer list")
-        m = _find_q(qmap, question)
-        key = m["q_norm"] if m else _norm(question)
+        legacy = legacy_question(boards[parent_id].title, question) if use_legacy_profiles else None
+        explicit = item.get("options") is not None
+        if not explicit and any(item.get(key) is not None for key in ("blocks", "linkWidget")):
+            raise ParseError(code="CABINET_PLAN_INVALID", message="Block selectors require the complete option list")
+        m = _find_q(qmap, question) if not (legacy or explicit) else None
+        key = m["q_norm"] if m else question_key(question)
         if key in seen_questions:
             raise ParseError(code="CABINET_PLAN_INVALID", message="Duplicate questionnaire question")
         seen_questions.add(key)
@@ -491,6 +539,29 @@ async def correct_cabinet(
         select_all = _norm(SELECT_ALL) in chosen
         if select_all and len(chosen) != 1:
             raise ParseError(code="CABINET_PLAN_INVALID", message="Select all cannot be combined with individual answers")
+        if legacy or explicit:
+            if not archives:
+                for bid, board in boards.items():
+                    state = await repository.get(base_url, reg, bid) if repository else CabinetWidgetState()
+                    states[bid] = state
+                    archives[bid] = _confirmed_archive(state, widgets_to_input(board.widgets), bid)
+            for selection in resolve_options(item, legacy, boards, archives, SYSTEM_KEEP):
+                board_id = selection.board
+                if selection.link_widget is not None:
+                    if repository is None and not dry_run:
+                        raise ParseError(code="CABINET_WIDGET_ARCHIVE_REQUIRED", message="An archive is required to change widget links")
+                    link_key = (board_id, selection.link_widget)
+                    if link_key in link_selections:
+                        raise ParseError(code="CABINET_PLAN_INVALID", message="Questions overlap on the same links widget")
+                    link_selections[link_key] = (selection.allowed, selection.selected)
+                else:
+                    allowed, selected, required = selections.get(board_id, (set(), set(), set()))
+                    if allowed & selection.allowed:
+                        raise ParseError(code="CABINET_PLAN_INVALID", message="Questions overlap on the same widget")
+                    selections[board_id] = (allowed | selection.allowed, selected | selection.selected,
+                                            required | selection.selected)
+                plans.append(QuestionPlan(question, "prune", board_id))
+            continue
         if select_all and (m is None or repository is None):
             plans.append(QuestionPlan(question, "skip-select-all"))
             continue
@@ -524,16 +595,24 @@ async def correct_cabinet(
         raise ParseError(code="CABINET_PLAN_INVALID", message=f"Cannot resolve all questionnaire targets: {invalid}")
 
     changes = []
-    for board_id, (allowed, selected, required) in selections.items():
+    target_boards = dict.fromkeys([*selections, *(board_id for board_id, _ in link_selections)])
+    for board_id in target_boards:
+        allowed, selected, required = selections.get(board_id, (set(), set(), set()))
+        link_targets = [(header, *labels) for (bid, header), labels in link_selections.items() if bid == board_id]
+        if allowed & {header for header, *_ in link_targets}:
+            raise ParseError(code="CABINET_PLAN_INVALID", message="Questions overlap on the same links widget")
         board = boards[board_id]
         current = widgets_to_input(board.widgets)
-        state = await repository.get(base_url, reg, board_id) if repository else CabinetWidgetState([])
-        archive = state.archive
-        if state.pending is not None:
-            if current != state.pending["after"]:
-                raise ParseError(code="WIDGET_WRITE_UNCERTAIN", message=f"Previous widget write is still unconfirmed for {board_id!r}")
-            archive = state.pending["archive"]
-        expected, hidden, removed, restored = _widget_selection(current, archive, allowed, selected)
+        state = states.get(board_id)
+        if state is None:
+            state = await repository.get(base_url, reg, board_id) if repository else CabinetWidgetState()
+        archive = _confirmed_archive(state, current, board_id)
+        hidden_widgets = [entry for entry in archive if "widget" in entry]
+        hidden_links = [entry for entry in archive if "links" in entry]
+        expected, hidden, removed, restored = _widget_selection(current, hidden_widgets, allowed, selected)
+        expected, hidden_links, removed_links, restored_links = _select_links(expected, hidden_links, link_targets)
+        removed += removed_links
+        restored += restored_links
         if required - {_norm(widget.get("header")) for widget in expected}:
             raise ParseError(code="CABINET_WIDGET_NOT_FOUND", message=f"A selected widget is absent from the cabinet and archive for {board_id!r}")
         if expected != current and repository:
@@ -545,7 +624,7 @@ async def correct_cabinet(
                 plan.keep_headers = [widget.get("header") for widget in expected]
                 plan.delete_headers = removed
                 plan.restore_headers = restored
-        changes.append((board, current, expected, state, archive, hidden))
+        changes.append((board, current, expected, state, archive, hidden + hidden_links))
 
     if dry_run:
         return plans

@@ -66,7 +66,7 @@ async def inspect_operations(args):
         if args.command == "list":
             result = await session.execute(text(
                 f"SELECT {SUMMARY_COLUMNS} FROM integration_events WHERE source_namespace = :namespace "
-                "AND (:status IS NULL OR status = :status) ORDER BY id DESC LIMIT :limit"
+                "AND (CAST(:status AS text) IS NULL OR status = :status) ORDER BY id DESC LIMIT :limit"
             ), {"namespace": namespace, "status": args.status, "limit": args.limit})
             return [dict(row) for row in result.mappings()]
         events = await session.execute(text(
