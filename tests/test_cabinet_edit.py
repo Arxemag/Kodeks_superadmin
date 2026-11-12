@@ -337,9 +337,11 @@ def test_native_link_input_omits_nullable_response_fields_and_keeps_explicit_val
     assert cabinet_edit.widget_to_input({
         "__typename": "LinksWidget", "header": "Ссылки", "titleLink": {"href": "", "about": None},
         "links": [{"title": "Вариант", "href": "/docs", "about": None, "notForChange": False}],
+        "listId": {"limit": None, "listId": 0},
     }) == {
         "header": "Ссылки", "titleLink": {"href": ""},
         "links": [{"title": "Вариант", "href": "/docs", "notForChange": False}],
+        "listId": {"listId": 0},
     }
 
 

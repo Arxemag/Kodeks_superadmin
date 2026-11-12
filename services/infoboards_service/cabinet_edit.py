@@ -223,19 +223,21 @@ async def fetch_board(
     )
 
 
+def _native_input(value):
+    if isinstance(value, dict):
+        return {key: _native_input(item) for key, item in value.items() if item is not None}
+    if isinstance(value, list):
+        return [_native_input(item) for item in value]
+    return value
+
+
 def widget_to_input(widget: dict[str, Any]) -> dict[str, Any]:
     """Преобразовать виджет из board.one в объект для ConfigInput.widgets (срез вычисляемых полей и None)."""
-    result = {
+    return _native_input({
         k: v
         for k, v in widget.items()
-        if k not in _COMPUTED_WIDGET_FIELDS and v is not None
-    }
-    if "links" in result:
-        result["links"] = [{key: value for key, value in link.items() if value is not None}
-                           for link in result["links"]]
-    if "titleLink" in result:
-        result["titleLink"] = {key: value for key, value in result["titleLink"].items() if value is not None}
-    return result
+        if k not in _COMPUTED_WIDGET_FIELDS
+    })
 
 
 def widgets_to_input(widgets: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -255,14 +257,14 @@ async def set_widgets(
     (см. widgets_to_input). Сериализуется в JSON-строку, как ожидает каталог.
     """
     config_input: dict[str, Any] = {
-        **board.settings,
+        **_native_input(board.settings),
         "id": board.id,
         "author": board.author,
         "title": board.title,
         "widgets": json.dumps(widget_inputs, ensure_ascii=False),
     }
     if board.search_string is not None:
-        config_input["searchString"] = board.search_string
+        config_input["searchString"] = _native_input(board.search_string)
     logger.debug(
         "set_widgets board_id=%r widgets_count=%s headers=%s",
         board.id, len(widget_inputs), [w.get("header") for w in widget_inputs],
